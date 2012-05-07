@@ -1,10 +1,11 @@
 (ns c-in-clj.core
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str])
+  (:import [System.IO StringReader]))
 
 (defprotocol ICModuleContext
   (beginfn [this name ret args])
   (resolve-sym [this sym])
-  (compilefn [this body])
+  (compilefn [this name ret args header body])
   (clean [this] [this func]))
 
 (defn null-module-context []
@@ -12,11 +13,12 @@
     ICModuleContext
     (beginfn [this name ret args])
     (resolve-sym [this sym])
-    (compilefn [this body])
+    (compilefn [this name ret args header body]
+      (println body))
     (clean [this])
     (clean [this func])))
 
-(def ^:dynamic *cmodule-context* (null-module-context))
+(def ^:dynamic *cmodule-context* (atom (null-module-context)))
 
 (def ^:private cintrinsics (atom {}))
 
@@ -34,9 +36,9 @@
     (apply intrinsic args)
     (if (contains? *locals* sym)
       (c-func-call (name sym) args)
-      (if-let [foreign (resolve-sym *cmodule-context* sym)]
+      (if-let [foreign (resolve-sym @*cmodule-context* sym)]
         (c-func-call foreign args)
-        (throw (ArgumentException. (str "Don't know how to handled list symbol " sym)))))))
+        (throw (ArgumentException. (str "Don't know how to handle list symbol " sym)))))))
 
 (defn cexpand-list
   ([form]
@@ -170,9 +172,6 @@
 (cintrinsic 'label (fn [x] (str (name x) ":")))
 (cintrinsic 'goto (fn [x] (str "goto " (name x))))
 
-(cintrinsic 'decl (fn ([type name init] (str type " " name " = " init))
-                    ([type name] (let [res (str type " " name)] (println res) res))))
-
 (def ^:private ctypes (atom {}))
 
 (defmacro add-ctypes [& type-map]
@@ -201,6 +200,26 @@
         ctype (get-in @ctypes [type-name :ctype])]
     (str ctype ptr-part)))
 
+(defn get-clr-type [type-name]
+  (let [type-name (name type-name)
+        ptr-idx (.IndexOf type-name "*")
+        ptr-part (when (> ptr-idx 0) (.Substring type-name ptr-idx))
+        type-name (if ptr-part (.Substring type-name 0 ptr-idx) type-name)
+        info (@ctypes type-name)]
+    (when info
+      (if ptr-part
+        IntPtr
+        (eval (:clr-type info))))))
+
+(cintrinsic 'decl (fn ([type name init]
+                        (set! *locals* (conj *locals* name))
+                        (let [type (get-ctype type)]
+                          (str type " " name " = " init)))
+                    ([type name]
+                       (set! *locals* (conj *locals* name))
+                       (let [type (get-ctype type)]
+                          (str type " " name)))))
+
 (defn cfnsig [name ret args]
   (str (get-ctype ret) " "
        name "("
@@ -214,45 +233,56 @@
         localnames (for [local locals] (second local))]
     (apply hash-set (into argnames localnames))))
 
-(defn compile-cfn [name ret args body]
-  (beginfn *cmodule-context* name ret args)
-  (let [sig-txt (cfnsig name ret args)
-        init (first body)
-        locals (when (vector? init) init)
-        local-decls (map (fn [x] '(decl ~@x)) locals)
-        body (if locals
-               (into local-decls (rest body))
-               body)
-        local-names (extract-locals args locals)
-        body-txt (binding [*locals* local-names]
-                   (println *locals*)
-                   (println body)
-                   (cblock body))
-        fn-txt (str sig-txt "\n" body-txt "\n")
-        compiled (compilefn *cmodule-context* fn-txt)]
-    (println)
-    (print fn-txt)
-    compiled))
+(def ^:dynamic *header*)
 
-(defmacro cfn [name ret args & body]
+(defn init-header []
+  (str ))
+
+(defn print-numbered [txt]
+  (let [rdr (StringReader. txt)]
+    (loop [line (.ReadLine rdr)
+           i 0]
+      (when line
+        (println (str i "  " line))
+        (recur (.ReadLine rdr) (inc i))))))
+
+(defn compile-cfn [name ret args body]
+  (beginfn @*cmodule-context* name ret args)
+  (binding [*header* "#include <stdint.h>\n"]
+    (let [sig-txt (cfnsig name ret args)
+          init (first body)
+          locals (when (vector? init) init)
+          local-decls (map (fn [x] '(decl ~@x)) locals)
+          body (if locals
+                 (into local-decls (rest body))
+                 body)
+          local-names (extract-locals args locals)
+          body-txt (binding [*locals* local-names]
+                     (cblock body))
+          header-txt *header*
+          fn-txt (str sig-txt "\n" body-txt "\n")
+          compiled (compilefn @*cmodule-context* name ret args header-txt fn-txt)]
+      compiled)))
+
+(defmacro cdefn [name ret args & body]
   (compile-cfn name ret args body))
 
-(cinclude "stdio.h")
+;(cinclude "stdio.h")
 
-(cfn test1 i32 [i32 x]
-     (if (> 0 1)
-       (= x (- (+ x 1) 5)))
-     (else (if (< 0 1)
-             (while (= 0 1)
-               (++ x)
-               (-- x))))
-     (return x))
+(cdefn add double [double x double y]
+       (return (+ x y)))
 
-(ptest1 23895623589)
-LoadLibrary -> dll handle
-GetProcAddress -> func ptr
-Alloc ptr to ptr, Set ptr = func ptr
-resolve test1 -> ptr to func ptr
+(cdefn test2 double [double x]
+       (return (add (* 5 x) x)))
 
-(cfn test2 i32 [i32 x i32 y]
-     (return (+ (test1 x) (test1 y))))
+(cdefn test3 double [double x]
+       (return (test2 x)))
+
+;(ptest1 23895623589)
+;LoadLibrary -> dll handle
+;GetProcAddress -> func ptr
+;Alloc ptr to ptr, Set ptr = func ptr
+;resolve test1 -> ptr to func ptr
+
+(comment (cdefn test2 i32 [i32 x i32 y]
+                (return (+ (test1 x) (test1 y)))))
