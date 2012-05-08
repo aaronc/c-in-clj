@@ -70,20 +70,31 @@
          :params args
          :invoker (atom nil)}))))
 
+(defn- get-dg-type [ret-type param-types]
+  (let [dg-sig (into [ret-type] param-types)]
+    (or (@dg-type-cache dg-sig)
+        (let [dg-type (clr-delegate* ret-type param-types)]
+          (swap! dg-type-cache assoc dg-sig dg-type)
+          dg-type))))
+
 (defn- make-invoker [fn-ptr ret args]
   (let [ret-type (get-clr-type ret)
         param-types (map get-clr-type (take-nth 2 args))
-        dg-sig (into [ret-type] param-types)
-        dg-type (or (@dg-type-cache dg-sig)
-                    (let [dg-type (clr-delegate* ret-type param-types)]
-                      (swap! dg-type-cache assoc dg-sig dg-type)
-                      dg-type))
-        dg (Marshal/GetDelegateForFunctionPointer fn-ptr dg-type)]
-    dg))
+        dg-type (get-dg-type ret-type param-types)
+        dg (Marshal/GetDelegateForFunctionPointer fn-ptr dg-type)
+        invoke-method (.GetMethod dg-type "Invoke")]
+    (fn [& args]
+      (.Invoke invoke-method dg (to-array args)))))
 
 (defn get-invoker [ctxt name]
   (when-let [fn-info (@(:fn-index ctxt) name)]
     (make-invoker @(:fn-ptr fn-info) (:return fn-info) (:params fn-info))))
+
+(defmacro gen-c-delegate [ret params args & body]
+  (let [dg-type (get-dg-type (eval ret) (eval params))]
+    `(let [dg# (gen-delegate ~dg-type ~args ~@body)]
+        {:dg dg#
+         :fp (System.Runtime.InteropServices.Marshal/GetFunctionPointerForDelegate dg#)})))
 
 (defn msvc-compile [ctxt name ret args header body]
   (let [name (str name)
@@ -92,10 +103,18 @@
         text (str header "\n\n_declspec(dllexport) " body)]
     (spit filename text)
     (if (= 0 (run-cl compile-path (:cl-path ctxt) (str "/LD " filename) body text))
-      (let [fn-index (:fn-index ctxt)]
-        (swap! fn-index assoc name (update-fn-ref name ret args filename (@fn-index name))))
-      (clean-fn-files filename))
-    nil))
+      (let [fn-index (:fn-index ctxt)
+            fn-info (update-fn-ref name ret args filename (@fn-index name))
+            invoker (:invoker fn-info)]
+        (swap! fn-index assoc name fn-info)
+        (with-meta
+          (fn [& args]
+            (if-let [ivk @invoker]
+              (apply ivk args)
+              (let [ivk (reset! invoker (get-invoker ctxt name))]
+                (apply ivk args))))
+          {:fn-info fn-info}))
+      (clean-fn-files filename))))
 
 (defn msvc-beginfn [ctxt name ret args])
 

@@ -26,6 +26,22 @@
 
 (def ^:dynamic *locals* [])
 
+(def ^:private cmodules (atom {}))
+
+(def ^:private cmodules-by-ns (atom {}))
+
+(def ^:private defined-types (atom {}))
+
+(defmacro cmodule [name]
+  (let [mod (atom {:name name :ns *ns* :includes #{} :deftypes {}})]
+    (swap! cmodules assoc name mod)
+    (swap! cmodules-by-ns assoc *ns* mod)
+    nil))
+
+(defn cinclude [header]
+  (when-let [mod (@cmodules-by-ns *ns*)]
+    (swap! mod update-in [:includes] conj (str "<" header ">"))))
+
 (declare cexpand)
 
 (defn c-func-call [func args]
@@ -62,7 +78,7 @@
 
 (defn cexpand [form]
   (cond
-   (number? form) form
+   (number? form) (pr-str form)
    (string? form) (pr-str form)
    (list? form) (cexpand-list form)
    (keyword? form) (name form)
@@ -101,6 +117,11 @@
 (cop -- [x] (str "--" x))
 (cop ++' [x] (str x "++"))
 (cop --' [x] (str x "--"))
+
+(cintrinsic '. (fn [& args]
+                   (str/join "." (map cexpand args))))
+(cintrinsic '-> (fn [& args]
+                   (str/join "->" (map cexpand args))))
 
 (defn indent [] (str/join (for [x (range *indent*)] " ")))
 
@@ -192,40 +213,74 @@
  double double Double
  void void nil)
 
+(defn fn-ptr-sig [fn-ptr-vec name]
+  (let [ret (first fn-ptr-vec)
+        params (rest fn-ptr-vec)]
+    (str ret "(*" name ")(" (str/join "," params) ")")))
+
+(def ^:dynamic *local-def-types* {})
+
+(defn get-def-type [type-name]
+  (if-let [type-name* (*local-def-types* type-name)]
+    type-name*
+    (when-let [typedef (@defined-types type-name)]
+      (set! *header* (str *header* "\n" typedef "\n"))
+      (set! *local-def-types* (assoc *local-def-types* type-name type-name))
+      type-name)))
+
 (defn get-ctype [type-name]
-  (let [type-name (name type-name)
-        ptr-idx (.IndexOf type-name "*")
-        ptr-part (when (> ptr-idx 0) (.Substring type-name ptr-idx))
-        type-name (if ptr-part (.Substring type-name 0 ptr-idx) type-name)
-        ctype (get-in @ctypes [type-name :ctype])]
-    (str ctype ptr-part)))
+  (if (vector? type-name)
+    (fn-ptr-sig type-name nil)
+    (let [type-name (name type-name)
+          ptr-idx (.IndexOf type-name "*")
+          ptr-part (when (> ptr-idx 0) (.Substring type-name ptr-idx))
+          type-name (if ptr-part (.Substring type-name 0 ptr-idx) type-name)
+          ctype (or (get-in @ctypes [type-name :ctype])
+                    (get-def-type type-name))]
+      (str ctype ptr-part))))
 
 (defn get-clr-type [type-name]
-  (let [type-name (name type-name)
-        ptr-idx (.IndexOf type-name "*")
-        ptr-part (when (> ptr-idx 0) (.Substring type-name ptr-idx))
-        type-name (if ptr-part (.Substring type-name 0 ptr-idx) type-name)
-        info (@ctypes type-name)]
-    (when info
-      (if ptr-part
-        IntPtr
-        (eval (:clr-type info))))))
+  (if (vector? type-name)
+    IntPtr
+    (let [type-name (name type-name)
+          ptr-idx (.IndexOf type-name "*")
+          ptr-part (when (> ptr-idx 0) (.Substring type-name ptr-idx))
+          type-name (if ptr-part (.Substring type-name 0 ptr-idx) type-name)
+          info (@ctypes type-name)]
+      (when info
+        (if ptr-part
+          IntPtr
+          (eval (:clr-type info)))))))
 
-(cintrinsic 'decl (fn ([type name init]
-                        (set! *locals* (conj *locals* name))
-                        (let [type (get-ctype type)]
-                          (str type " " name " = " init)))
-                    ([type name]
-                       (set! *locals* (conj *locals* name))
-                       (let [type (get-ctype type)]
-                          (str type " " name)))))
+(defn c-type-name-pair [t n]
+  (if (vector? t)
+    (fn-ptr-sig t n)
+    (str (get-ctype t) " " n)))
+
+(defn cdecl
+  ([type name init]
+     (set! *locals* (conj *locals* name))
+     (let [tn (c-type-name-pair type name)]
+       (str tn " = " init)))
+  ([type name]
+     (set! *locals* (conj *locals* name))
+     (c-type-name-pair type name)))
+
+(cintrinsic 'decl cdecl)
+
+(defn ccast [ty nm]
+  (str "((" (get-ctype ty) ")" (cexpand nm) ")"))
+
+(cintrinsic 'cast ccast)
 
 (defn cfnsig [name ret args]
   (str (get-ctype ret) " "
        name "("
        (str/join ", "
                  (for [[t n] (partition 2 args)]
-                   (str (get-ctype t) " " n)))
+                   (if (vector? t)
+                     (fn-ptr-sig t n)
+                     (str (get-ctype t) " " n))))
        ")"))
 
 (defn extract-locals [args locals]
@@ -235,9 +290,6 @@
 
 (def ^:dynamic *header*)
 
-(defn init-header []
-  (str ))
-
 (defn print-numbered [txt]
   (let [rdr (StringReader. txt)]
     (loop [line (.ReadLine rdr)
@@ -246,9 +298,36 @@
         (println (str i "  " line))
         (recur (.ReadLine rdr) (inc i))))))
 
+(defmacro cstruct [name & members]
+  (let [name (str name)]
+    (binding [*header* ""
+              *local-def-types* {name (str "struct " name)}]
+      (let [body-txt
+            (str/join (map #(str " " (apply c-type-name-pair %) ";\n")
+                           (partition 2 (map str members))))
+            struct-txt
+            (str "typedef struct " name " {\n"
+                 body-txt
+                 "} " name ";")
+            mod (@cmodules-by-ns *ns*)]
+        (swap! defined-types assoc name struct-txt)
+        (swap! mod assoc-in [:deftypes name] struct-txt)
+        (println struct-txt)))))
+
+(defn init-header []
+  (set! *header* (str *header* "#include <stdint.h>\n"))
+    (when-let [mod (@cmodules-by-ns *ns*)]
+      (let [includes
+            (str/join
+             "\n" (for [include (:includes mod)]
+               (str "#include " include)))]
+        (set! *header* (str *header* "\n" includes)))))
+
 (defn compile-cfn [name ret args body]
   (beginfn @*cmodule-context* name ret args)
-  (binding [*header* "#include <stdint.h>\n"]
+  (binding [*header* ""
+            *local-def-types* {}]
+    (init-header)
     (let [sig-txt (cfnsig name ret args)
           init (first body)
           locals (when (vector? init) init)
@@ -262,21 +341,24 @@
           header-txt *header*
           fn-txt (str sig-txt "\n" body-txt "\n")
           compiled (compilefn @*cmodule-context* name ret args header-txt fn-txt)]
-      compiled)))
+      (intern *ns* name compiled))))
 
 (defmacro cdefn [name ret args & body]
   (compile-cfn name ret args body))
 
 ;(cinclude "stdio.h")
+(comment
+  (cdefn add double [double x double y]
+         (return (+ x y)))
 
-(cdefn add double [double x double y]
-       (return (+ x y)))
+  (cdefn test2 double [double x]
+         (return (add (* 7 x) (/ 47.435 x))))
 
-(cdefn test2 double [double x]
-       (return (add (* 5 x) x)))
+  (cdefn test3 double [double x]
+         (return (test2 x)))
 
-(cdefn test3 double [double x]
-       (return (test2 x)))
+  (cdefn test4 double [double x [double double double] func]
+         (return (func x x))))
 
 ;(ptest1 23895623589)
 ;LoadLibrary -> dll handle
