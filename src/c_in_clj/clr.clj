@@ -78,13 +78,15 @@
           dg-type))))
 
 (defn- make-invoker [fn-ptr ret args]
-  (let [ret-type (get-clr-type ret)
-        param-types (map get-clr-type (take-nth 2 args))
-        dg-type (get-dg-type ret-type param-types)
-        dg (Marshal/GetDelegateForFunctionPointer fn-ptr dg-type)
-        invoke-method (.GetMethod dg-type "Invoke")]
-    (fn [& args]
-      (.Invoke invoke-method dg (to-array args)))))
+  (binding [*header* ""
+            *local-def-types* {}]
+    (let [ret-type (get-clr-type ret)
+          param-types (map get-clr-type (take-nth 2 args))
+          dg-type (get-dg-type ret-type param-types)
+          dg (Marshal/GetDelegateForFunctionPointer fn-ptr dg-type)
+          invoke-method (.GetMethod dg-type "Invoke")]
+      (fn [& args]
+        (.Invoke invoke-method dg (to-array args))))))
 
 (defn get-invoker [ctxt name]
   (when-let [fn-info (@(:fn-index ctxt) name)]
@@ -96,11 +98,11 @@
         {:dg dg#
          :fp (System.Runtime.InteropServices.Marshal/GetFunctionPointerForDelegate dg#)})))
 
-(defn msvc-compile [ctxt name ret args header body]
+(defn msvc-compile [ctxt name ret args body]
   (let [name (str name)
         compile-path (:compile-path ctxt)
         filename (Path/Combine compile-path (str name "__" (swap! (:save-id ctxt) inc) ".c"))
-        text (str header "\n\n_declspec(dllexport) " body)]
+        text (str *header* "\n\n_declspec(dllexport) " body)]
     (spit filename text)
     (if (= 0 (run-cl compile-path (:cl-path ctxt) (str "/LD " filename) body text))
       (let [fn-index (:fn-index ctxt)

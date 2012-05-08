@@ -5,7 +5,7 @@
 (defprotocol ICModuleContext
   (beginfn [this name ret args])
   (resolve-sym [this sym])
-  (compilefn [this name ret args header body])
+  (compilefn [this name ret args body])
   (clean [this] [this func]))
 
 (defn null-module-context []
@@ -13,7 +13,7 @@
     ICModuleContext
     (beginfn [this name ret args])
     (resolve-sym [this sym])
-    (compilefn [this name ret args header body]
+    (compilefn [this name ret args body]
       (println body))
     (clean [this])
     (clean [this func])))
@@ -23,6 +23,8 @@
 (def ^:private cintrinsics (atom {}))
 
 (def ^:dynamic *indent* 0)
+
+(def ^:dynamic *header*)
 
 (def ^:dynamic *locals* [])
 
@@ -117,6 +119,8 @@
 (cop -- [x] (str "--" x))
 (cop ++' [x] (str x "++"))
 (cop --' [x] (str x "--"))
+
+(cop sizeof [x] (str "sizeof(" x ")"))
 
 (cintrinsic '. (fn [& args]
                    (str/join "." (map cexpand args))))
@@ -246,11 +250,13 @@
           ptr-idx (.IndexOf type-name "*")
           ptr-part (when (> ptr-idx 0) (.Substring type-name ptr-idx))
           type-name (if ptr-part (.Substring type-name 0 ptr-idx) type-name)
-          info (@ctypes type-name)]
-      (when info
+          info (@ctypes type-name)
+          def-info (get-def-type type-name)]
+      (if info
         (if ptr-part
           IntPtr
-          (eval (:clr-type info)))))))
+          (eval (:clr-type info)))
+        (when (and def-info ptr-part) IntPtr)))))
 
 (defn c-type-name-pair [t n]
   (if (vector? t)
@@ -261,7 +267,7 @@
   ([type name init]
      (set! *locals* (conj *locals* name))
      (let [tn (c-type-name-pair type name)]
-       (str tn " = " init)))
+       (str tn " = " (cexpand init))))
   ([type name]
      (set! *locals* (conj *locals* name))
      (c-type-name-pair type name)))
@@ -283,12 +289,9 @@
                      (str (get-ctype t) " " n))))
        ")"))
 
-(defn extract-locals [args locals]
-  (let [argnames (for [[_ n] (partition 2 args)] n)
-        localnames (for [local locals] (second local))]
-    (apply hash-set (into argnames localnames))))
+(defn extract-locals [args]
+  (apply hash-set (for [[_ n] (partition 2 args)] n)))
 
-(def ^:dynamic *header*)
 
 (defn print-numbered [txt]
   (let [rdr (StringReader. txt)]
@@ -316,31 +319,23 @@
 
 (defn init-header []
   (set! *header* (str *header* "#include <stdint.h>\n"))
-    (when-let [mod (@cmodules-by-ns *ns*)]
-      (let [includes
-            (str/join
-             "\n" (for [include (:includes mod)]
-               (str "#include " include)))]
-        (set! *header* (str *header* "\n" includes)))))
+  (when-let [mod (@cmodules-by-ns *ns*)]
+    (let [includes
+          (str/join
+           "\n" (for [include (:includes @mod)]
+                  (str "#include " include)))]
+      (set! *header* (str *header* includes "\n")))))
 
 (defn compile-cfn [name ret args body]
   (beginfn @*cmodule-context* name ret args)
   (binding [*header* ""
-            *local-def-types* {}]
+            *local-def-types* {}
+            *locals* (extract-locals args)]
     (init-header)
     (let [sig-txt (cfnsig name ret args)
-          init (first body)
-          locals (when (vector? init) init)
-          local-decls (map (fn [x] '(decl ~@x)) locals)
-          body (if locals
-                 (into local-decls (rest body))
-                 body)
-          local-names (extract-locals args locals)
-          body-txt (binding [*locals* local-names]
-                     (cblock body))
-          header-txt *header*
+          body-txt (cblock body)
           fn-txt (str sig-txt "\n" body-txt "\n")
-          compiled (compilefn @*cmodule-context* name ret args header-txt fn-txt)]
+          compiled (compilefn @*cmodule-context* name ret args fn-txt)]
       (intern *ns* name compiled))))
 
 (defmacro cdefn [name ret args & body]
