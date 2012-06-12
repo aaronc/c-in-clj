@@ -83,7 +83,7 @@
 (defmacro cbinops [& syms]
   `(do ~@(for [x syms] `(cbinop ~x))))
 
-(cbinops + - * / % == != > >= < <= >> >> = += -= *= /= %= <<= >>=)
+(cbinops + - / % == != > >= < <= >> >> = += -= *= /= %= <<= >>=)
 
 (cbinop* bor "|")
 (cbinop* or "||")
@@ -133,6 +133,12 @@
                                    (cstatement (first statements)))
                       :default (cblock statements))))
 
+(cintrinsic '*
+            (fn [x] (let [x (cexpand x)] (str "*" x)))
+            (fn [x y] (let [x (cexpand x)
+                           y (cexpand y)]
+                       (str "(" x " * " y ")"))))
+
 (cintrinsic 'if
             (fn [expr & statements]
               (str "if(" (reduce-parens (cexpand expr)) ")\n"
@@ -170,9 +176,6 @@
 (cintrinsic 'label (fn [x] (str (name x) ":")))
 (cintrinsic 'goto (fn [x] (str "goto " (name x))))
 
-(cintrinsic 'decl (fn ([type name init] (str type " " name " = " init))
-                    ([type name] (let [res (str type " " name)] (println res) res))))
-
 (def ^:private ctypes (atom {}))
 
 (defmacro add-ctypes [& type-map]
@@ -201,6 +204,9 @@
         ctype (get-in @ctypes [type-name :ctype])]
     (str ctype ptr-part)))
 
+(cintrinsic 'decl (fn ([type name init] (let [init (cexpand init)] (str (get-ctype type) " " name " = " init)))
+                    ([type name] (let [res (str (get-ctype type) " " name)] (println res) res))))
+
 (defn cfnsig [name ret args]
   (str (get-ctype ret) " "
        name "("
@@ -219,9 +225,11 @@
   (let [sig-txt (cfnsig name ret args)
         init (first body)
         locals (when (vector? init) init)
-        local-decls (map (fn [x] '(decl ~@x)) locals)
+        local-decls (vec (map (fn [x] (into x '(decl))) locals))
         body (if locals
-               (into local-decls (rest body))
+               (do
+                 (println local-decls)
+                 (into local-decls (rest body)))
                body)
         local-names (extract-locals args locals)
         body-txt (binding [*locals* local-names]
@@ -256,3 +264,10 @@ resolve test1 -> ptr to func ptr
 
 (cfn test2 i32 [i32 x i32 y]
      (return (+ (test1 x) (test1 y))))
+
+(cfn avg double [double* data u64 len]
+     [(u64 i 0) (double sum 0) (double* pdata data)]
+     (while (< i len)
+       (+= sum (* (++' pdata)))
+       (++ i))
+     (return (/ sum len)))
