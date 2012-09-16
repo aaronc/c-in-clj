@@ -1,7 +1,7 @@
 (ns c-in-clj.clr
   (:import [System.Diagnostics Process ProcessStartInfo]
            [System.IO Path File Directory]
-           [System.Runtime.InteropServices Marshal])
+           [System.Runtime.InteropServices Marshal GCHandle GCHandleType])
   (:require [clojure.string :as str])
   (:use [c-in-clj.core]
         [clojure.clr pinvoke emit]))
@@ -40,13 +40,48 @@
   (try
     (File/Delete (Path/ChangeExtension fname ".dll"))
     (File/Delete (Path/ChangeExtension fname ".c"))
+    (File/Delete (Path/ChangeExtension fname ".cpp"))
     (File/Delete (Path/ChangeExtension fname ".obj"))
     (catch Exception ex
       (println ex))))
 
+(comment
+  (defn update-fn-refs [funcs fnames existing]
+    (let [new-dll-handle (LoadLibrary (Path/ChangeExtension fname ".dll"))
+          new-fn-ptrs (for [{:keys [name]} funcs]
+                        (GetProcAddress new-dll-handle name))]
+      (if existing
+        (let [fn-ptr (:fn-ptr existing)
+              fn-ptr-ptr (:fn-ptr-ptr existing)
+              dll-handle (:dll-handle existing)
+              last-fname (:filename existing)
+              invoker (:invoker existing)]
+          (reset! invoker nil)
+          (reset! fn-ptr new-fn-ptr)
+          (Marshal/WriteIntPtr fn-ptr-ptr new-fn-ptr)
+          (FreeLibrary dll-handle)
+                                        ;(clean-fn-files last-fname)
+          (assoc existing :filename fname :dll-handle new-dll-handle
+                 :return ret :params args))
+        (let [fn-ptr-ptr (Marshal/AllocHGlobal IntPtr/Size)]
+          (Marshal/WriteIntPtr fn-ptr-ptr new-fn-ptr)
+          {:fn-ptr (atom new-fn-ptr)
+           :fn-ptr-ptr fn-ptr-ptr
+           :dll-handle new-dll-handle
+           :filename fname
+           :return ret
+           :params args
+           :invoker (atom nil)})))))
+
+(defn- count-args-size [args]
+  (let [param-types (map get-clr-type (take-nth 2 args))]
+    (reduce + (map #(let [^Type t %] (Marshal/SizeOf t)) param-types))))
+
 (defn update-fn-ref [name ret args fname existing]
   (let [new-dll-handle (LoadLibrary (Path/ChangeExtension fname ".dll"))
+        name (str "_" name "@" (count-args-size args))
         new-fn-ptr (GetProcAddress new-dll-handle name)]
+    (println "Loaded" name "at" new-fn-ptr)
     (if existing
       (let [fn-ptr (:fn-ptr existing)
             fn-ptr-ptr (:fn-ptr-ptr existing)
@@ -57,7 +92,7 @@
         (reset! fn-ptr new-fn-ptr)
         (Marshal/WriteIntPtr fn-ptr-ptr new-fn-ptr)
         (FreeLibrary dll-handle)
-        (clean-fn-files last-fname)
+        ;(clean-fn-files last-fname)
         (assoc existing :filename fname :dll-handle new-dll-handle
                :return ret :params args))
       (let [fn-ptr-ptr (Marshal/AllocHGlobal IntPtr/Size)]
@@ -94,31 +129,58 @@
 
 (defmacro gen-c-delegate [ret params args & body]
   (let [dg-type (get-dg-type (eval ret) (eval params))]
-    `(let [dg# (gen-delegate ~dg-type ~args ~@body)]
-        {:dg dg#
-         :fp (System.Runtime.InteropServices.Marshal/GetFunctionPointerForDelegate dg#)})))
+    `(let [dg# (gen-delegate ~dg-type ~args ~@body)
+           gch# (System.Runtime.InteropServices.GCHandle/Alloc
+                 dg#)
+           fp# (System.Runtime.InteropServices.Marshal/GetFunctionPointerForDelegate dg#)]
+       {:dg dg#
+        :gch gch#
+        :fp fp#})))
+
+(defn msvc-compile-file [{:keys [compile-path cl-path] :as ctxt} filename text body on-compile]
+  (spit filename text)
+  (if (= 0 (run-cl compile-path cl-path (str "user32.lib gdi32.lib /EHs /Gz " "/LD " filename) body text))
+    (on-compile)
+    (clean-fn-files filename)))
+
+(defn msvc-on-compile [ctxt filename name ret args]
+  (let [fn-index (:fn-index ctxt)
+        fn-info (update-fn-ref name ret args filename (@fn-index name))
+        invoker (:invoker fn-info)]
+    (swap! fn-index assoc name fn-info)
+    (with-meta
+      (fn [& args]
+        (if-let [ivk @invoker]
+          (apply ivk args)
+          (let [ivk (reset! invoker (get-invoker ctxt name))]
+            (apply ivk args))))
+      {:fn-info fn-info})))
 
 (defn msvc-compile [ctxt name ret args body]
   (let [name (str name)
         compile-path (:compile-path ctxt)
-        filename (Path/Combine compile-path (str name "__" (swap! (:save-id ctxt) inc) ".c"))
-        text (str *header* "\n\n_declspec(dllexport) " body)]
-    (spit filename text)
-    (if (= 0 (run-cl compile-path (:cl-path ctxt) (str "/LD " filename) body text))
-      (let [fn-index (:fn-index ctxt)
-            fn-info (update-fn-ref name ret args filename (@fn-index name))
-            invoker (:invoker fn-info)]
-        (swap! fn-index assoc name fn-info)
-        (with-meta
-          (fn [& args]
-            (if-let [ivk @invoker]
-              (apply ivk args)
-              (let [ivk (reset! invoker (get-invoker ctxt name))]
-                (apply ivk args))))
-          {:fn-info fn-info}))
-      (clean-fn-files filename))))
+        filename (Path/Combine compile-path (str name "__" (swap! (:save-id ctxt) inc) ".cpp"))
+        text (str *header* "\n\nextern \"C\" __declspec(dllexport) " body)]
+    (msvc-compile-file
+     ctxt
+     filename
+     text
+     body
+     (fn [] (msvc-on-compile ctxt filename name ret args)))))
 
-(defn msvc-beginfn [ctxt name ret args])
+(defn msvc-compile-multiple [ctxt funcs]
+  (let [body (str/join "\n\n" (map (fn [x] (str "extern \"C\" __declspec(dllexport) " (:body x))) funcs))
+        name (str/join "_" (map :name funcs))
+        compile-path (:compile-path ctxt)
+        filename (Path/Combine compile-path (str name "__" (swap! (:save-id ctxt) inc) ".cpp"))
+        text (str *header* body)]
+    (msvc-compile-file ctxt filename text body
+                       (fn []
+                         (reduce
+                          (fn [res {:keys [name ret args]}]
+                            (assoc res name (msvc-on-compile ctxt filename
+                                                             (str name) ret args)))
+                          {} funcs)))))
 
 (defn msvc-resolvesym [ctxt sym]
   (let [fn-name (name sym)]
@@ -139,7 +201,7 @@
 (extend MSVCCompileContext
   ICModuleContext
   {:compilefn #'msvc-compile
-   :beginfn #'msvc-beginfn
+   :compilefns #'msvc-compile-multiple
    :resolve-sym #'msvc-resolvesym
    :clean #'msvc-clean})
 
@@ -157,3 +219,5 @@
            (if x64 "x64" "x86")
            "cl.exe"))
     (MSVCCompileContext. compile-path cl-bat-path (atom 0) (atom {}))))
+
+(reset! *cmodule-context* (init-msvc-context))
