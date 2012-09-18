@@ -198,8 +198,8 @@
                               (if block
                                 (let [block (binding [*indent* (inc *indent*)]
                                               (cstatement block))]
-                                  (str (indent) "case " (cexpand expr) ":\n" block))
-                                (str (indent) "default:" (cexpand expr)))))]
+                                  (str (indent) "case " (cexpand expr) ":\n" block "\n" (indent) "break;\n"))
+                                (str (indent) "default:" (cexpand expr) "\n" (indent) "break;\n"))))]
                 (str "switch(" (cexpand test) ") {\n" (str/join "\n" cases) (indent) "\n}"))))
 
 (defn cblock [statements]
