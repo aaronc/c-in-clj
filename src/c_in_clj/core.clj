@@ -290,6 +290,8 @@
   (if-let [type-name* (*local-def-types* type-name)]
     type-name*
     (when-let [typedef (@defined-types type-name)]
+      (doseq [type-ref (:type-refs typedef)]
+        (get-def-type type-ref))
       (set! *header* (str *header* "\n" (:text typedef) "\n"))
       (set! *local-def-types* (assoc *local-def-types* type-name type-name))
       type-name)))
@@ -397,7 +399,8 @@
                  body-txt
                  "} " name ";")
             mod (@cmodules-by-ns *ns*)
-            info {:text struct-txt}]
+            info {:text struct-txt
+                  :type-refs (remove #(= name %) (keys *local-def-types*))}]
         (add-def-type name info)
         (println struct-txt)))))
   
