@@ -82,9 +82,12 @@
         :default (throw (ArgumentException. (str "Don't know how to handle list starting with" op)))))))
 
 (defn cexpand-sym [sym]
-  (cond
+  (if
    (contains? *locals* sym) (name sym)
-   :default (throw (ArgumentException. (str "Unresolved symbol " sym)))))
+   (if-let [foreign
+            (resolve-sym @*cmodule-context* sym)]
+     foreign
+     (throw (ArgumentException. (str "Unresolved symbol " sym))))))
 
 (defn cexpand [form]
   (cond
@@ -130,6 +133,7 @@
 (cop -- [x] (str "--" x))
 (cop ++' [x] (str x "++"))
 (cop --' [x] (str x "--"))
+(cop bit-not [x] (str "~" x))
 
 (cop ? [x y z] (str "(" x " ? " y " : " z ")"))
 
