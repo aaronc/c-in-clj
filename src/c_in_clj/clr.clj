@@ -74,12 +74,16 @@
            :invoker (atom nil)})))))
 
 (defn- count-args-size [args]
-  (let [param-types (map get-clr-type (take-nth 2 args))]
-    (reduce + (map #(let [^Type t %] (Marshal/SizeOf t)) param-types))))
+  (when (even? (count args))
+    (let [param-types (map get-clr-type (take-nth 2 args))]
+      (reduce + (map #(let [^Type t %] (Marshal/SizeOf t)) param-types)))))
 
 (defn update-fn-ref [name ret args fname existing]
   (let [new-dll-handle (LoadLibrary (Path/ChangeExtension fname ".dll"))
-        name (str "_" name "@" (count-args-size args))
+        args-size (count-args-size args)
+        name (if args-size
+               (str "_" name "@" args-size)
+               name)
         new-fn-ptr (GetProcAddress new-dll-handle name)]
     (println "Loaded" name "at" new-fn-ptr)
     (if existing
@@ -115,13 +119,14 @@
 (defn- make-invoker [fn-ptr ret args]
   (binding [*header* ""
             *local-def-types* {}]
-    (let [ret-type (get-clr-type ret)
-          param-types (map get-clr-type (take-nth 2 args))
-          dg-type (get-dg-type ret-type param-types)
-          dg (Marshal/GetDelegateForFunctionPointer fn-ptr dg-type)
-          invoke-method (.GetMethod dg-type "Invoke")]
-      (fn [& args]
-        (.Invoke invoke-method dg (to-array args))))))
+    (when (even? (count args))
+      (let [ret-type (get-clr-type ret)
+            param-types (map get-clr-type (take-nth 2 args))
+            dg-type (get-dg-type ret-type param-types)
+            dg (Marshal/GetDelegateForFunctionPointer fn-ptr dg-type)
+            invoke-method (.GetMethod dg-type "Invoke")]
+        (fn [& args]
+          (.Invoke invoke-method dg (to-array args)))))))
 
 (defn get-invoker [ctxt name]
   (when-let [fn-info (@(:fn-index ctxt) name)]

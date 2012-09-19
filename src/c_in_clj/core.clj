@@ -360,10 +360,14 @@
   (str (get-ctype ret) " "
        name "("
        (str/join ", "
-                 (for [[t n] (partition 2 args)]
-                   (if (vector? t)
-                     (fn-ptr-sig t n)
-                     (str (get-ctype t) " " n))))
+                 (for [[t n] (partition-all 2 args)]
+                   (cond
+                    (and (nil? n) (= "..." (name t)))
+                    "..."
+                    (vector? t)
+                    (fn-ptr-sig t n)
+                    :default
+                    (str (get-ctype t) " " n))))
        ")"))
 
 (defn extract-locals [args]
