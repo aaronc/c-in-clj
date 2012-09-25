@@ -6,6 +6,9 @@
   (:use [c-in-clj.core]
         [clojure.clr pinvoke emit]))
 
+(defn- write-file [name text]
+  (File/WriteAllText name text))
+
 (dllimports "kernel32.dll"
             (LoadLibrary IntPtr [String])
             (GetProcAddress IntPtr [IntPtr String])
@@ -79,13 +82,19 @@
       (reduce + (map #(let [^Type t %] (Marshal/SizeOf t)) param-types)))))
 
 (defn update-fn-ref [name ret args fname existing]
-  (let [new-dll-handle (LoadLibrary (Path/ChangeExtension fname ".dll"))
+  (let [dll-path (Path/ChangeExtension fname ".dll")
+        new-dll-handle (LoadLibrary dll-path)
         args-size (count-args-size args)
-        name (if args-size
+        proc-name (if args-size
                (str "_" name "@" args-size)
                name)
-        new-fn-ptr (GetProcAddress new-dll-handle name)]
-    (println "Loaded" name "at" new-fn-ptr)
+        new-fn-ptr (GetProcAddress new-dll-handle proc-name)]
+    (when (= IntPtr/Zero new-fn-ptr)
+      (throw (Exception. (str "Unable to load " proc-name))))
+    (println "Loaded" proc-name "at" new-fn-ptr)
+    (let [dir-name (Path/GetDirectoryName fname)
+          cache-file-name (Path/Combine dir-name name)]
+      (write-file cache-file-name fname))
     (if existing
       (let [fn-ptr (:fn-ptr existing)
             fn-ptr-ptr (:fn-ptr-ptr existing)
@@ -143,7 +152,7 @@
         :fp fp#})))
 
 (defn msvc-compile-file [{:keys [compile-path cl-path] :as ctxt} filename text body on-compile]
-  (spit filename text)
+  (write-file filename text)
   (if (= 0 (run-cl compile-path cl-path (str "user32.lib gdi32.lib /EHs /Gz " "/LD " filename) body text))
     (on-compile)
     (clean-fn-files filename)))
@@ -161,17 +170,32 @@
             (apply ivk args))))
       {:fn-info fn-info})))
 
+(defn check-cache [ctxt name text ret args]
+  (when (not (contains? @(:fn-index ctxt) name))
+    (println "Checking cache for" name)
+    (let [compile-path (:compile-path ctxt)
+          cache-file-name (Path/Combine compile-path name)]
+      (when (File/Exists cache-file-name)
+        (let [cached-c-file-name (slurp cache-file-name :encoding "UTF8")
+              cached-text (when (File/Exists cached-c-file-name) (slurp cached-c-file-name :encoding "UTF8"))]
+          (when (= cached-text text)
+            (println "Loading" name "from cache")
+            (msvc-on-compile
+             ctxt cached-c-file-name name ret args)))))))
+
 (defn msvc-compile [ctxt name ret args body]
   (let [name (str name)
         compile-path (:compile-path ctxt)
         filename (Path/Combine compile-path (str name "__" (swap! (:save-id ctxt) inc) ".cpp"))
         text (str *header* "\n\nextern \"C\" __declspec(dllexport) " body)]
-    (msvc-compile-file
-     ctxt
-     filename
-     text
-     body
-     (fn [] (msvc-on-compile ctxt filename name ret args)))))
+    (or
+     (check-cache ctxt name text ret args)
+     (msvc-compile-file
+      ctxt
+      filename
+      text
+      body
+      (fn [] (msvc-on-compile ctxt filename name ret args))))))
 
 (defn msvc-compile-multiple [ctxt funcs]
   (let [body (str/join "\n\n" (map (fn [x] (str "extern \"C\" __declspec(dllexport) " (:body x))) funcs))
@@ -217,7 +241,7 @@
         x64 (= IntPtr/Size 8)]
     (when-not (Directory/Exists compile-path)
       (Directory/CreateDirectory compile-path))
-    (spit cl-bat-path
+    (write-file cl-bat-path
           (String/Format
            "@echo off\r\ncall \"{0}\" {1}\r\n{2} %*\r\n"
            (Path/Combine msvc-path "vcvarsall.bat")
