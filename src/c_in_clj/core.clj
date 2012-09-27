@@ -216,8 +216,8 @@
   (let [nsts (count statements)]
                      (cond
                       (= 0 nsts) "{ }"
-                      (= 1 nsts) (binding [*indent* (inc *indent*)]
-                                   (cstatement (first statements)))
+                      ;; (= 1 nsts) (binding [*indent* (inc *indent*)]
+                      ;;              (cstatement (first statements)))
                       :default (cblock statements))))
 
 (cintrinsic 'if
