@@ -130,9 +130,13 @@
 (cbinop* set! "=")
 
 (cop ++ [x] (str "++" x))
+(cop inc [x] (str "++" x))
 (cop -- [x] (str "--" x))
+(cop dec [x] (str "--" x))
 (cop ++' [x] (str x "++"))
+(cop post-inc [x] (str x "++"))
 (cop --' [x] (str x "--"))
+(cop post-dec [x] (str x "--"))
 (cop bit-not [x] (str "~" x))
 
 (cop ? [x y z] (str "(" x " ? " y " : " z ")"))
