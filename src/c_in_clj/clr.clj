@@ -48,46 +48,21 @@
     (catch Exception ex
       (println ex))))
 
-(comment
-  (defn update-fn-refs [funcs fnames existing]
-    (let [new-dll-handle (LoadLibrary (Path/ChangeExtension fname ".dll"))
-          new-fn-ptrs (for [{:keys [name]} funcs]
-                        (GetProcAddress new-dll-handle name))]
-      (if existing
-        (let [fn-ptr (:fn-ptr existing)
-              fn-ptr-ptr (:fn-ptr-ptr existing)
-              dll-handle (:dll-handle existing)
-              last-fname (:filename existing)
-              invoker (:invoker existing)]
-          (reset! invoker nil)
-          (reset! fn-ptr new-fn-ptr)
-          (Marshal/WriteIntPtr fn-ptr-ptr new-fn-ptr)
-          (FreeLibrary dll-handle)
-                                        ;(clean-fn-files last-fname)
-          (assoc existing :filename fname :dll-handle new-dll-handle
-                 :return ret :params args))
-        (let [fn-ptr-ptr (Marshal/AllocHGlobal IntPtr/Size)]
-          (Marshal/WriteIntPtr fn-ptr-ptr new-fn-ptr)
-          {:fn-ptr (atom new-fn-ptr)
-           :fn-ptr-ptr fn-ptr-ptr
-           :dll-handle new-dll-handle
-           :filename fname
-           :return ret
-           :params args
-           :invoker (atom nil)})))))
-
 (defn- count-args-size [args]
   (when (even? (count args))
     (let [param-types (map get-clr-type (take-nth 2 args))]
       (reduce + (map #(let [^Type t %] (Marshal/SizeOf t)) param-types)))))
 
+(defn get-proc-name [name args]
+  (let [args-size (count-args-size args)]
+    (if args-size
+      (str "_" name "@" args-size)
+      name)))
+
 (defn update-fn-ref [name ret args fname existing]
   (let [dll-path (Path/ChangeExtension fname ".dll")
         new-dll-handle (LoadLibrary dll-path)
-        args-size (count-args-size args)
-        proc-name (if args-size
-               (str "_" name "@" args-size)
-               name)
+        proc-name (get-proc-name name args)
         new-fn-ptr (GetProcAddress new-dll-handle proc-name)]
     (when (= IntPtr/Zero new-fn-ptr)
       (throw (Exception. (str "Unable to load " proc-name))))
@@ -225,11 +200,12 @@
 
 (defn msvc-clean ([this]) ([this func]))
 
-(defrecord MSVCCompileContext [compile-path cl-path save-id fn-index])
+(defrecord MSVCDevContext [compile-path cl-path save-id fn-index])
 
-(extend MSVCCompileContext
+(extend MSVCDevContext
   ICModuleContext
-  {:compilefn #'msvc-compile
+  {:init-module (constantly nil)
+   :compilefn #'msvc-compile
    :compilefns #'msvc-compile-multiple
    :resolve-sym #'msvc-resolvesym
    :clean #'msvc-clean})
@@ -247,6 +223,54 @@
            (Path/Combine msvc-path "vcvarsall.bat")
            (if x64 "x64" "x86")
            "cl.exe"))
-    (MSVCCompileContext. compile-path cl-bat-path (atom 0) (atom {}))))
+    (MSVCDevContext. compile-path cl-bat-path (atom 0) (atom {}))))
 
 (reset! *cmodule-context* (init-msvc-context))
+
+(defn compile-init-module [{:keys [modules]} module-name package-name]
+  (swap! modules assoc-in [module-name package-name] {:header-text "" :impl-text ""}))
+
+(defrecord MSVCCompileContext [modules])
+
+(defn compile-init-context []
+  (MSVCCompileContext. (atom {})))
+
+(defn dll-init-module [{:keys [modules] :as ctxt} module-name package-name]
+  (let [module (or (get modules module-name)
+                   (let [dll (LoadLibrary module-name)
+                         module {:dll dll}]
+                     (swap! modules assoc module-name module)
+                     module))]
+    (reset! (:cur-module ctxt) module)))
+
+(defn dll-load-fn [{:keys [cur-module]} name ret args body]
+  (let [proc-name (get-proc-name name args)
+        proc-address (GetProcAddress (:dll cur-module) proc-name)]
+    (make-invoker)))
+
+(defn dll-load-fns [ctxt funcs]
+  (into {}
+        (for [{:keys [name ret args body]} funcs]
+          [name (dll-load-fn ctxt name ret args body)])))
+
+(defn dll-resolve-sym [ctxt sym] sym)
+
+(defn dll-clean [{:keys [modules cur-module]}]
+  (reset! cur-module nil)
+  (doseq [[name mod] @modules]
+    (FreeLibrary mod))
+  (reset! cur-module nil))
+
+(defrecord DllImportContext [modules cur-module])
+
+(extend DllImportContext
+  ICModuleContext
+  {:init-module #'dll-init-module
+   :compilefn #'dll-load-fn
+   :compilefns #'dll-load-fns
+   :resolve-sym #'dll-resolve-sym
+   :clean (constantly nil)})
+
+(defn dll-init-context []
+  (DllImportContext. (atom {}) (atom nil)))
+

@@ -3,6 +3,7 @@
   (:import [System.IO StringReader]))
 
 (defprotocol ICModuleContext
+  (init-module [this module-name package-name])
   (resolve-sym [this sym])
   (compilefn [this name ret args body])
   (compilefns [this funcs])
@@ -11,6 +12,7 @@
 (defn null-module-context []
   (reify
     ICModuleContext
+    (init-module [this module-name package-name])
     (resolve-sym [this sym])
     (compilefn [this name ret args body]
       (println body))
@@ -443,15 +445,12 @@
            compiled (compilefn @*cmodule-context* name ret args fn-txt)]
        (intern *ns* name compiled)))))
 
-(def test123 (atom nil))
-
 (defn compile-cfns [funcs]
   (wrap-compile-cfn
    (fn []
      (let [funcs (for [[name ret args & body] funcs]
                    {:name name :ret ret :args args :body (create-cfn-body name ret args body)})
            compiled (compilefns @*cmodule-context* funcs)]
-       (reset! test123 compiled)
        (doseq [[name func] compiled]
          (intern *ns* name func))))))
 
