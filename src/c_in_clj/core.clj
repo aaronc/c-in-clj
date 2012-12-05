@@ -1,6 +1,22 @@
 (ns c-in-clj.core
-  (:require [clojure.string :as str])
-  (:import [System.IO StringReader]))
+;;   "A framework for dynamically translating clojure expressions directly into C code.
+
+;; Mapping of clojure s-expressions to their C-language counterparts:
+;; +, -, *, /, mod, inc, post-inc, dec, post-dec
+;; = (==), not= (!=), <, >, <=, >=
+;; or, and
+;; bit-and, bit-or, bit-xor, bit-not, bit-shift-left, bit-shift-right
+;; if, case, do, while, for, case, break, continue, goto, label
+;; sizeof
+;; let
+;; set! (=), and=, or=, xor=
+;; cast
+;; aget, aset
+;; ., ->, ref (&), deref (*)
+;; cpp-mode only: \ (::)
+;; comment
+;; "
+  (:require [clojure.string :as str]))
 
 (defprotocol ICModuleContext
   (init-module [this module-name package-name])
@@ -116,30 +132,33 @@
 (defmacro cbinops [& syms]
   `(do ~@(for [x syms] `(cbinop ~x))))
 
-(cbinops + - * / % == != > >= < <= >> >> = += -= *= /= %= <<= >>=)
+(cbinops + - * / > >= < <= += -= *= /= %= <<= >>=)
+(cbinop* = "==")
+(cbinop* not= "!=")
+(cbinop* mod "%")
 
-(cbinop* bit-or "|")
 (cbinop* or "||")
-(cbinop* or= "|=")
-(cbinop* bit-and "&")
-(cbinop* bit-shift-left "<<")
-(cbinop* bit-shift-right ">>")
 (cbinop* and "&&")
-(cbinop* and= "&=")
-(cbinop* xor "^")
-(cbinop* xor= "^=")
+(cbinop* bit-or "|")
+(cbinop* bit-or= "|=")
+(cbinop* bit-and "&")
+(cbinop* bit-and= "&=")
+(cbinop* bit-shift-left "<<")
+(cbinop* bit-shift-left="<<=")
+(cbinop* bit-shift-right ">>")
+(cbinop* bit-shift-right= ">>=")
+(cbinop* bit-xor "^")
+(cbinop* bit-xor= "^=")
+(cbinop* bit-not "~")
+(cbinop* bit-not= "~=")
 (cbinop* comma ",")
 (cbinop* set! "=")
 
-(cop ++ [x] (str "++" x))
 (cop inc [x] (str "++" x))
-(cop -- [x] (str "--" x))
 (cop dec [x] (str "--" x))
-(cop ++' [x] (str x "++"))
 (cop post-inc [x] (str x "++"))
-(cop --' [x] (str x "--"))
 (cop post-dec [x] (str x "--"))
-(cop bit-not [x] (str "~" x))
+(cop not [x] (str "!" x))
 
 (cop ? [x y z] (str "(" x " ? " y " : " z ")"))
 
@@ -223,18 +242,13 @@
                       :default (cblock statements))))
 
 (cintrinsic 'if
-            (fn [expr & statements]
-              (str "if(" (reduce-parens (cexpand expr)) ")\n"
-                   (child-block statements))))
-
-(cintrinsic 'else
-            (fn [& statements]
-              (str "else "
-                   (let [nsts (count statements)]
-                     (cond
-                      (= 0 nsts) "{ }"
-                      (= 1 nsts) (cstatement (first statements) :noindent true)
-                      :default (cblock statements))))))
+            (fn ([expr then]
+                  (str "if(" (cexpand-reduce expr) ")\n"
+                       (cexpand then)))
+              ([expr then else]
+                 (str "if(" (cexpand-reduce expr) ")\n"
+                      (cexpand then) "\n"
+                      "else " (cexpand else)))))
 
 (cintrinsic 'for
             (fn [init test each & statements]
@@ -261,7 +275,7 @@
 
 (cintrinsic 'comment (fn [x] (str "/*" x "*/")))
 
-(cintrinsic 'block (fn [& statements] (cblock statements)))
+(cintrinsic 'do (fn [& statements] (cblock statements)))
 
 (def ^:private ctypes (atom {}))
 
@@ -379,14 +393,11 @@
 (defn extract-locals [args]
   (apply hash-set (for [[_ n] (partition 2 args)] n)))
 
-
 (defn print-numbered [txt]
-  (let [rdr (StringReader. txt)]
-    (loop [line (.ReadLine rdr)
-           i 0]
-      (when line
-        (println (str i "  " line))
-        (recur (.ReadLine rdr) (inc i))))))
+  (let [lines (str/split-lines txt)]
+    (doall
+     (map-indexed
+      (fn [i line] (println (str i "  " line))) lines))))
 
 (defn- cstruct-member [member]
   (let [ty (first member)
