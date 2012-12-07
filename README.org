@@ -7,8 +7,10 @@ Work in progress, not ready to use.
 
 ** Create c function:
 
-(cdefn /function_name/ /return_type/ [/arg1_type/ /arg1/]
-  /function_body/)
+#+begin_src clojure
+(cdefn function_name return_type [arg1_type /arg1/]
+  function_body...)
+#+end_src
 
 ex:
 
@@ -29,6 +31,7 @@ ex:
 | uint32_t | u32       |
 | int64_t  | i64       |
 | uint64_t | u64       |
+
 *** *float* (32-bit) and *double* (64-bit) floating point types
 *** void
 *** char
@@ -38,9 +41,12 @@ Multiple *'s can be added to the end of a type name as needed.
 
 ** Structures
 C structure's can be defined as below:
-(cstruct /struct_name/
- (/member1_type/ /member1/)
+
+#+begin_src clojure
+(cstruct struct_name
+ (member1_type member1)
  ...)
+#+end_src
 
 ** Literal symbol names
 Any clojure keyword will be interpreted as a symbol literal. The
@@ -50,7 +56,7 @@ has available (used to invoke functions from the repl, dynamically
 redefine symbols, and for certain macros).
 
 ex:
-:void* and void* are equivalent except that c-in-clj can use the
+src_<clojure>{:void*} and src_<clojure>{void*} are equivalent except that c-in-clj can use the
 information in void* to know that this is a pointer type whereas
 c-in-clj will treat :void* as if it is just void (without any type
 information).
@@ -83,44 +89,44 @@ not done carefully.
 
 ** Keywords and Operators:
 
-| c-in-clj expression | c equivalent |
-|---+---|
-| (+ x y) | x + y |
-| (- x y) | x - y |
-| (* x y) | x * y |
-| (/ x y) | x / y |
-| (mod x y) | x % y  |
-| (= x y) | x == y |
-| (not= x y) | x != y |
-| (< x y) | x < y |
-| (> x y) | x > y |
-| (<= x y) | x <= y |
-| (>= x y) | x >= y |
-| (or x y) | (x || y) |
-| (and x y) | (x && y) |
-| (bit-and x y) | (x & y) |
-| (bit-or x y) | (x | y) |
-| (bit-xor x y) | (x ^ y) |
-| (bit-shift-left x y) | (x << y) |
-| (bit-shift-right x y) | (x >> y) |
-| (set! x y) | (x = y) |
-| (and= x y) | (x &= y) |
-| (or= x y) | (x |= y) |
-| (xor= x y) | (x ^= y) |
-| (inc x) | ++x |
-| (post-inc x) | x++ |
-| (dec x) | --x |
-| (post-dec x) | x-- |
-| (not x) | !x |
-| (bit-not x) | ~x  |
-| (. x y) | x.y | 
-| (-> x y) | x->y   |
-| (ref x) | &x |
-| (deref x) or @x |  *x |
-| (aget x i) | x[i] |
-| (aset x i z) | x[i] = z |
-| (sizeof x) | sizeof(x) |
-| (cast i32* x) | (int32_t*)x |
+| c-in-clj expression   | c equivalent     |
+|-----------------------+------------------|
+| (+ x y)               | x + y            |
+| (- x y)               | x - y            |
+| (* x y)               | x * y            |
+| (/ x y)               | x / y            |
+| (mod x y)             | x % y            |
+| (= x y)               | x == y           |
+| (not= x y)            | x != y           |
+| (< x y)               | x < y            |
+| (> x y)               | x > y            |
+| (<= x y)              | x <= y           |
+| (>= x y)              | x >= y           |
+| (or x y)              | (x \vert\vert y) |
+| (and x y)             | (x && y)         |
+| (bit-and x y)         | (x & y)          |
+| (bit-or x y)          | (x \vert y)      |
+| (bit-xor x y)         | (x ^ y)          |
+| (bit-shift-left x y)  | (x << y)         |
+| (bit-shift-right x y) | (x >> y)         |
+| (set! x y)            | (x = y)          |
+| (and= x y)            | (x &= y)         |
+| (or= x y)             | (x \vert= y)     |
+| (xor= x y)            | (x ^= y)         |
+| (inc x)               | ++x              |
+| (post-inc x)          | x++              |
+| (dec x)               | --x              |
+| (post-dec x)          | x--              |
+| (not x)               | !x               |
+| (bit-not x)           | ~x               |
+| (. x y)               | x.y              |
+| (-> x y)              | x->y             |
+| (ref x)               | &x               |
+| (deref x) or @x       | *x               |
+| (aget x i)            | x[i]             |
+| (aset x i z)          | x[i] = z         |
+| (sizeof x)            | sizeof(x)        |
+| (cast i32* x)         | (int32_t*)x      |
    
 ** c-in-clj statements
    
@@ -257,4 +263,4 @@ for(i = 0, j = 0; i < x && j < y; ++i ++j)
 **** TODO array type names
 **** TODO let statements
 **** TODO cpp-mode only: \ (::)
-
+     
