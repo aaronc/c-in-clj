@@ -1,4 +1,5 @@
 ;;(add-ns-load-mapping "clj_parse" "c:/users/arc/dev/mtreader/apps/pharmaseqcommon/clj-parse/src/clj_parse")
+;;(add-ns-load-mapping "c_in_clj" "c:/users/arc/dev/mtreader/apps/pharmaseqcommon/c-in-clj/src/c_in_clj")
 
 (ns c-in-clj.gcc.gdb
   (:use [clj-parse core helpers])
@@ -27,14 +28,6 @@
                (mcharstr "error") (mcharstr "exit"))))
 
 (def mi-variable (mapply (comp keyword str) (m+ (mexcept \=))))
-
-(defparsertype MatchCStringEscape [] [this ctxt]
-  (wrap-track-fail ctxt
-                   (when (not (cdone? ctxt))
-                     (let [x (cpeek ctxt)]
-                       (when (or (not= 0 x )
-                                 (= 0 (last (second ctxt))))
-                         (cpop-conj ctxt x))))))
 
 (def mi-c-string
   (mapply
@@ -90,7 +83,8 @@
     (mdefault [nil] (m? mi-token))
     (mignore \^)
     mi-result-class
-    (mgroup
+    (mapply
+     hash-map
      (m* (mseq (mignore \,) mi-result))))))
 
 (def mi-async-class
@@ -156,18 +150,30 @@
 
 (defn parse-gdb-mi-line [line]
   (try
-    (println "gdb:" line)
-    (gdb-mi-output-line (str/trim line))
+    (first (gdb-mi-output-line (str/trim line)))
     (catch Object ex
-      (swap! glines conj line)
       (throw ex))))
 
-(defn gdb-data-received [sender args]
+(defn gdb-data-received [sender args callbacks]
   (try
-    (let [line (.Data args)]
-      (println (parse-gdb-mi-line line)))
-    (catch Object ex
+      (let [line (.Data args)]
+        (let [res (parse-gdb-mi-line line)
+              token (:token res)]
+          (cond
+           token (do
+                   ;;(println "gdb:" line)
+                   ;;(prn res)
+                   ((get @callbacks token) res))
+           (= "(gdb)" res) nil
+           :default (do
+                      (println "gdb:" line)
+                      (prn res)))))
+      (catch Object ex
         (println "Error"))))
+
+(defn- wrap-gdb-data-received [callbacks]
+  (fn on-gdb-data-received [sender args]
+    (gdb-data-received sender args callbacks)))
 
 (def gdb-client (atom nil))
 
@@ -181,7 +187,10 @@
         ;;Shell.bat" "nios2-gdb-server --tcpport 54321 --tcppersist")
         gdb (Process.)
         psi (.StartInfo gdb)
-        data-received-dg (gen-delegate DataReceivedEventHandler [s e] (gdb-data-received s e))]
+        callbacks (atom {})
+        data-received-fn (wrap-gdb-data-received callbacks)
+        data-received-dg (gen-delegate DataReceivedEventHandler [s e]
+                                       (data-received-fn s e))]
     (.set_FileName psi (Environment/ExpandEnvironmentVariables "%SOPC_KIT_NIOS2%\\Nios II Command Shell.bat"))
     (.set_Arguments psi "nios2-elf-gdb --interpreter=mi")
     (.set_UseShellExecute psi false)
@@ -193,14 +202,43 @@
     (.Start gdb)
     (.BeginOutputReadLine gdb)
     (let [stdin (.StandardInput gdb)]
-      (reset! gdb-client {:client gdb :stdin stdin}))))
+      (reset! gdb-client {:client gdb :stdin stdin
+                          :callbacks callbacks
+                          :data (atom {})}))))
 
-(defn kill-gdb []
-  )
+(def ^:private gdb-token-idx (atom 0))
 
-(defn gde [& cmds]
-  (let [{:keys [stdin]} (get-gdb-client)]
-    (.WriteLine stdin (apply str cmds))))
+(defn gde [& cmds+callback]
+  (let [callback? (first cmds+callback)
+        callback (when (ifn? callback?) callback?)
+        cmds (if callback (rest cmds+callback) cmds+callback)
+        {:keys [stdin callbacks]} (get-gdb-client)
+        token (when callback (swap! gdb-token-idx inc))]
+    (when callback
+      (swap! callbacks assoc token callback))
+    (.WriteLine stdin (str token (apply str cmds)))
+    token))
+
+(defn unregister-callback [token]
+  (let [callbacks (:callbacks (get-gdb-client))]
+    (swap! callbacks dissoc token)))
 
 (defn gdb-connect [port]
   (gde "-target-select remote localhost:" port))
+
+(defn kill-gdb []
+  (gde "quit")
+  (let [{:keys [client callbacks]} (get-gdb-client)]
+    (reset! callbacks nil)))
+
+(defn get-client-data []
+  (:data (get-gdb-client)))
+
+(defn gdb-sync-exec [& cmds]
+  (let [res-promise (promise)
+        token (apply gde
+           (fn [res] (deliver res-promise res))
+           cmds)
+        res @res-promise]
+    (unregister-callback token)
+    res))

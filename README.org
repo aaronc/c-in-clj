@@ -8,7 +8,7 @@ Work in progress, not ready to use.
 ** Create c function:
 
 #+begin_src clojure
-(cdefn function_name return_type [arg1_type /arg1/]
+(cdefn function_name return_type [arg1_type arg1]
   function_body...)
 #+end_src
 
@@ -20,7 +20,7 @@ ex:
 #+END_SRC
 
 ** Instrinsic types:
-*** Fixed width interger types from <stdint.h> with the corresponding aliases:
+*** Fixed width integer types from <stdint.h> with the corresponding aliases:
 | Type     | Alias(es) |
 |----------+-----------|
 | int8_t   | i8        |
@@ -102,7 +102,7 @@ not done carefully.
 | (> x y)               | x > y            |
 | (<= x y)              | x <= y           |
 | (>= x y)              | x >= y           |
-| (or x y)              | (x \vert\vert y) |
+| (or x y)              | (x \|\| y) |
 | (and x y)             | (x && y)         |
 | (bit-and x y)         | (x & y)          |
 | (bit-or x y)          | (x \vert y)      |
