@@ -182,7 +182,7 @@
 (defn get-gdb-client []
   (or *gdb-client* @gdb-client))
 
-(defn start-gdb []
+(defn start-gdb [path args]
   (let [;;gdb-server (start-process "%SOPC_KIT_NIOS2%\\Nios II Command
         ;;Shell.bat" "nios2-gdb-server --tcpport 54321 --tcppersist")
         gdb (Process.)
@@ -191,8 +191,8 @@
         data-received-fn (wrap-gdb-data-received callbacks)
         data-received-dg (gen-delegate DataReceivedEventHandler [s e]
                                        (data-received-fn s e))]
-    (.set_FileName psi (Environment/ExpandEnvironmentVariables "%SOPC_KIT_NIOS2%\\Nios II Command Shell.bat"))
-    (.set_Arguments psi "nios2-elf-gdb --interpreter=mi")
+    (.set_FileName psi path)
+    (.set_Arguments psi args)
     (.set_UseShellExecute psi false)
     (.set_RedirectStandardOutput psi true)
     (.set_RedirectStandardInput psi true)
@@ -223,13 +223,14 @@
   (let [callbacks (:callbacks (get-gdb-client))]
     (swap! callbacks dissoc token)))
 
-(defn gdb-connect [port]
+(defn gdb-connect-localhost [port]
   (gde "-target-select remote localhost:" port))
 
 (defn kill-gdb []
   (gde "quit")
   (let [{:keys [client callbacks]} (get-gdb-client)]
-    (reset! callbacks nil)))
+    (reset! callbacks nil)
+    (.Kill client)))
 
 (defn get-client-data []
   (:data (get-gdb-client)))

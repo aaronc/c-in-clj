@@ -197,9 +197,19 @@ specified position."
  (uint16_t    e_shnum) ;;  Section header table entry count 
  (uint16_t    e_shstrndx)) ;;  Section header string table index 
 
+(elfenum
+ ELF32_P_TYPE
+ :PT_NULL 0
+ :PT_LOAD 1
+ :PT_DYNAMIC 2
+ :PT_INTERP 3
+ :PT_NOTE 4
+ :PT_SHLIB 5
+ :PT_PHDR 6)
+
 (elf-struct32
  Phdr
- (uint32_t    p_type) ;;  Segment type 
+ (uint32_t    p_type :enum ELF32_P_TYPE) ;;  Segment type 
  (ElfN_Off     p_offset) ;;  Segment file offset 
  (ElfN_Addr    p_vaddr) ;;  Segment virtual address 
  (ElfN_Addr    p_paddr) ;;  Segment physical address 
@@ -221,19 +231,23 @@ specified position."
          :SHT_REL 9
          :SHT_SHLIB 10
          :SHT_DYNSYM 11
-         :SHT_LOPROC 0x70000000
-         :SHT_HIPROC 0x7fffffff
-         :SHT_LOUSER 0x80000000
-         :SHT_HIUSER 0xffffffff )
+         ;; :SHT_LOPROC 0x70000000
+         ;; :SHT_HIPROC 0x7fffffff
+         ;; :SHT_LOUSER 0x80000000
+         ;; :SHT_HIUSER 0xffffffff
+         )
+
+(def SHN_LORESERVE 0xff00)
 
 (elfenum shnum_special_enum
          :SHN_UNDEF 0
-         :SHN_LORESERVE 0xff00
-         :SHN_LOPROC 0xff00
-         :SHN_HIPROC 0xff1f
+         ;; :SHN_LORESERVE 0xff00
+         ;; :SHN_LOPROC 0xff00
+         ;; :SHN_HIPROC 0xff1f
          :SHN_ABS 0xfff1
          :SHN_COMMON 0xfff2
-         :SHN_HIRESERVE 0xffff)
+         ;;:SHN_HIRESERVE 0xffff
+         )
 
 (elf-struct32
  Shdr
@@ -253,8 +267,9 @@ specified position."
  :STB_LOCAL 0
  :STB_GLOBAL 1
  :STB_WEAK 2
- :STB_LOPROC 13
- :STB_HIPROC 15)
+ ;;:STB_LOPROC 13
+ ;;:STB_HIPROC 15
+ )
 
 (elfenum
  ELF32_ST_TYPE
@@ -263,8 +278,9 @@ specified position."
 :STT_FUNC 2
 :STT_SECTION 3
 :STT_FILE 4
-:STT_LOPROC 13
-:STT_HIPROC 15)
+;;:STT_LOPROC 13
+;;:STT_HIPROC 15
+)
 
 (defn parse-st_info [st_info]
   (let [st_bind (bit-shift-right st_info 4)
@@ -344,17 +360,19 @@ specified position."
           nil)]
    (assoc shdr :data data)))
 
-(defn- read-elf-Shdr [ehdr]
+(defn- read-elf-hdrs* [entsize num off type]
+  (when (> num 0)
+    (bgoto off)
+    (doall
+     (for [i (range num)]
+       (let [bytes (brbytes entsize)]
+         (with-buffer bytes
+           (read-elf-struct type)))))))
+
+(defn- read-elf-Shdrs [ehdr]
   (let [{:keys [e_shentsize e_shnum e_shoff e_shstrndx]} ehdr]
-    (when (> e_shnum 0)
-      (bgoto e_shoff)
-      (let [shdrs
-            (doall
-             (for [i (range e_shnum)]
-               (let [bytes (brbytes e_shentsize)]
-                 (with-buffer bytes
-                   (read-elf-struct :Shdr)))))
-            str-hdr (when (< e_shstrndx e_shnum)
+    (when-let [shdrs (read-elf-hdrs* e_shentsize e_shnum e_shoff :Shdr)]
+      (let [str-hdr (when (< e_shstrndx e_shnum)
                       (nth shdrs e_shstrndx))
             str-offset (:sh_offset str-hdr)
             shdrs
@@ -363,16 +381,26 @@ specified position."
                (let [str-pos (+ str-offset sh_name)]
                  (assoc shdr :name (brntstr str-pos)))))]
         (doall (map (partial load-elf-Shdr shdrs) shdrs))))))
+
+(defn- load-elf-Phdr [{:keys [p_offset p_filesz] :as phdr}]
+  (let [data (brbytes p_offset p_filesz)]
+    (assoc phdr :data data)))
+
+(defn- read-elf-Phdrs [ehdr]
+  (let [{:keys [e_phentsize e_phnum e_phoff]} ehdr]
+    (when-let [phdrs (read-elf-hdrs* e_phentsize e_phnum e_phoff :Phdr)]
+      (doall (map load-elf-Phdr phdrs)))))
  
 (defn read-elf32 [filename]
   (with-buffer filename
     (binding [*elf-arch* 32]
       (let [ehdr (read-elf-struct :Ehdr)
-            shdrs (read-elf-Shdr ehdr)]
+            shdrs (read-elf-Shdrs ehdr)
+            phdrs (read-elf-Phdrs ehdr)]
         {:filename (Path/GetFullPath filename)
          :elf-header ehdr
          :sections shdrs
-         :program-header nil}))))
+         :program-headers phdrs}))))
 
 (defn find-elf-section [elf name]
   (find-shdr (:sections elf) name))
@@ -385,9 +413,14 @@ specified position."
    (fn [sym] (= (get-in sym [:st_info :st_bind]) :STB_GLOBAL))
    (find-sym-table elf)))
 
-(defn filter-defined-symbols [global-symbols]
+(defn filter-data-symbols [global-symbols]
   (filter
-   (fn [sym] (not= (get-in sym [:st_shndx]) :SHN_UNDEF))
+   (fn [sym] (< (get-in sym [:st_shndx]) SHN_LORESERVE))
+   global-symbols))
+
+(defn filter-abs-symbols [global-symbols]
+  (filter
+   (fn [sym] (= (get-in sym [:st_shndx]) :SHN_ABS))
    global-symbols))
 
 (defn filter-undefined-symbols [global-symbols]

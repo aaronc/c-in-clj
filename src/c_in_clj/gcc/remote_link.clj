@@ -60,7 +60,7 @@
 (defn cache-obj-file [filename]
   (let [elf (elf/read-elf32 filename)
         global-symbols (elf/find-global-symbols elf)
-        defined-symbols (elf/filter-defined-symbols global-symbols)]
+        defined-symbols (elf/filter-data-symbols global-symbols)]
     (doseq [{:keys [name] :as sym} defined-symbols]
       (println "Caching" name)
       (swap! (get-data) assoc-in [:symbol-cache name]
@@ -121,6 +121,10 @@
         {:relocation-entry rel-entry
          :relocation-symbol r_sym
          :relocation-target rel-target}))))
+
+(defn set-symbol-addr [symbol-name addr]
+  (println "Setting symbol" symbol-name "address to" addr)
+  (swap! (get-data) assoc-in [:symbol-table symbol-name addr] addr))
 
 (defn link-symbol [symbol-name]
   (println "Trying to link" symbol-name)
