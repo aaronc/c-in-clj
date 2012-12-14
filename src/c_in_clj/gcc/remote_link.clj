@@ -72,24 +72,32 @@
                                 :STB_GLOBAL (:name rsym)
                                 :STB_LOCAL
                                 {:symbol rsym
-                                 :target-section (nth (:sections obj-file) st_shndx)})]
+                                 :target-idx st_shndx
+                                 :target-obj obj-file
+                                 :target-section (find-sym-section obj-file st_shndx)}
+                                :STB_WEAK
+                                (:name rsym))]
                    (assoc rel :target target)))
           global-symbols (for [{:keys [name st_value st_size]} section-globals]
             (let [sym-rels (filter (fn [{:keys [r_offset] :as rel}]
                                  (and (>= r_offset st_value)
                                       (<= r_offset (+ st_value st_size))))
-                                   rels)]
+                                   rels)
+                  sym-rels (for [rel sym-rels]
+                             (assoc rel :r_offset (- (:r_offset rel) st_value)))]
               {:name name
                :offset st_value
                :size st_shndx
                :section section
                :rels sym-rels}))
-          sym-rels (apply hash-set (apply concat (map :rels global-symbols)))
+          sym-rels (into #{} (apply concat (map :rels global-symbols)))
           section-rels (set/difference (apply hash-set rels) sym-rels)]
       {:section section
        :section-idx st_shndx
        :section-rels (vec section-rels)
-       :global-symbols global-symbols})))
+       :rels rels
+       :global-symbols global-symbols
+       :obj-file obj-file})))
 
 (defn- find-sym-in-cache [symbol-name]
   (get-in @(get-data) [:symbol-cache symbol-name]))
@@ -105,58 +113,19 @@
           (str "Unresolved symbol " name)
           {:type ::unresolved-symbol :name name})))
 
-(defn- find-relocation-target [obj-file {:keys [st_shndx name] :as r_sym}]
-  (println "Trying to locate" name)
-  (let [{:keys [st_bind st_type]} (:st_info r_sym)]
-    (cond
-     (and (= st_bind :STB_LOCAL)
-          ;;(= st_type :STT_SECTION)
-          (number? st_shndx))
-     (let [{:keys [section]} (find-sym-section+rels obj-file r_sym)
-           in-mem (find-section-in-memory section)]
-       (if in-mem
-         {:type :linked :data in-mem}
-         {:type :local
-          :data {:symdata r_sym :obj-file obj-file}}))
-     (= :SHN_UNDEF st_shndx) (or
-                              (when-let [mem-sym (find-sym-in-memory name)]
-                                {:type :linked :data mem-sym :name name})
-                              (when-let [global (find-sym-in-cache name)]
-                                {:type :global :data global :name name})
-                              (throw-unresolved-symbol name))
-     :default
-     (do (println "Not found" r_sym)
-         (throw-unresolved-symbol name)))))
-
-(defn- resolve-rel-entries [obj-file {:keys [sh_link data] :as rel-section}]
-  (let [sym-tab (:data (nth (:sections obj-file) sh_link))]
-    (for [{:keys [r_info] :as rel-entry} data]
-      (let [r_sym (:r_sym r_info)
-            r_sym (nth sym-tab r_sym)
-            {:keys [st_bind st_type]} (:st_info r_sym)
-            rel-target (find-relocation-target obj-file r_sym)]
-        {:relocation-entry rel-entry
-         :relocation-symbol r_sym
-         :relocation-target rel-target}))))
-
-(defn set-symbol-addr [symbol-name addr]
-  (println "Setting symbol" symbol-name "address to" addr)
-  (swap! (get-data) assoc-in [:symbol-table symbol-name addr] addr))
-
-(defn resolve-sym-refs [{:keys [symdata obj-file]} to-link]
-  (let [{:keys [section rels section-idx] :as section-data} (find-sym-section+rels obj-file symdata)]
-    (when-not (contains? @to-link section)
-      (let [rel-entries (apply concat
-                               (map
-                                (partial resolve-rel-entries obj-file)
-                                rels))]
-        (swap! to-link assoc section
-               {:rel-entries rel-entries
-                :obj-file obj-file
-                :section-idx section-idx})
-        (doseq [{:keys [relocation-target]} rel-entries]
-          (when (not= (:type relocation-target) :linked)
-            (resolve-sym-refs (:data relocation-target) to-link)))))))
+(defn resolve-sym-refs [obj-file st_shndx to-link]
+  (let [{:keys [section rels] :as section-info}
+        (process-section obj-file st_shndx)]
+    (when-not (contains? @to-link section-info)
+      (swap! to-link conj section-info)
+      (doseq [{:keys [target]} rels]
+        (if (string? target)
+          (when-not (find-sym-in-memory target)
+            (println "Searching for" target)
+            (if-let [{:keys [obj-file symdata]} (find-sym-in-cache target)]
+              (resolve-sym-refs obj-file (:st_shndx symdata) to-link)
+              (throw-unresolved-symbol target)))
+          (resolve-sym-refs (:target-obj target) (:target-idx target) to-link))))))
 
 (def null-target
   (reify IRemoteLinkerTarget
@@ -166,75 +135,129 @@
     (write-mem [this addr bytes])
     (zero-mem [this addr count])))
 
-(defn link-symbol [symbol-name target]
+(defn debug-clear []
+  (swap! (get-data) merge {:symbol-table nil :section-table nil})
+  nil)
+
+(defn link-symbol [symbol-name linker]
   (println "Trying to link" symbol-name)
   ;; Find sym in cache
   (if-let [{:keys [symdata obj-file] :as syminfo} (find-sym-in-cache symbol-name)]
-    (let [to-link (atom {})]
+    (let [to-link (atom #{})]
       ;; Find references to sym -> list of linked symbols, list of cached symbols
-      (resolve-sym-refs syminfo to-link)
+      (resolve-sym-refs obj-file (:st_shndx symdata) to-link)
       ;; If have all refs
       ;;  Write cached syms -> mem
-      (let [updated-symbols (atom #{})
-            newly-written
-            (doall
-             (for [[section {:keys [rel-entries obj-file section-idx]}] @to-link]
-               (let [{:keys [sh_size data]} section
-                     data-len (if data (.Length data) 0)
-                     zero-len (- sh_size data-len)]
-                 (println (:filename obj-file) (:name section) sh_size
-                          data-len)
-                 (when target
-                   (let [addr (alloc-mem target sh_size)]
-                     (when (> data-len 0) (write-mem target addr data))
-                     (when (> zero-len 0) (write-mem target (+ addr data-len) zero-len))
-                     (swap! (get-data) assoc-in [:section-table section]
-                            {:addr addr :size sh_size})
-                     (let [global-symbols (elf/find-global-symbols obj-file)
-                           section-symbols
-                           (filter (fn [sym] (= (:st_shndx sym) section-idx))
-                                   global-symbols)]
-                       (doseq [{:keys [name st_value st_size]} section-symbols]
-                         (when name
-                           (swap! updated-symbols conj name)
-                           (swap! (get-data) update-in [:symbol-table name]
-                                  merge
-                                  {:addr (+ addr st_value)
-                                   :size st_size}))))
-                     ;; find all global symbols in this section, and
-                     ;; update their ref in the symbol table
-                     ;; if there are pieces of code that refer to those
-                     ;; symbols, update their relocation entries
-                     {:section section
-                      :rel-entries rel-entries
-                      :obj-file obj-file
-                      :addr addr
-                      :size sh_size})))))]
-        ;; Updated references to updated symbols
-        (doseq [sym updated-symbols]
-          (let [{:keys [addr refs]} (find-sym-in-memory sym)]
-            (doseq [[sym-name {:keys [addr rel-entries]}] refs]
-              (do-relocation target relocation-entry section-addr target-addr))))
-        ;;  Perform relocations on newly written sections
-        (doseq [{:keys [rel-entries addr size]} newly-written]
-          (doseq [{:keys [relocation-symbol relocation-entry relocation-target]} rel-entries]
-            (let [section-addr addr
-                  target-addr (case (:st_bind (:st_info relocation-symbol))
-                                :STB_GLOBAL
-                                (let [{:keys [addr refs]} (find-sym-in-memory (:name relocation-symbol))]
-                                  addr)
-                         :STB_LOCAL
-                         (let [section (find-sym-section (:data relocation-target))
-                               {:keys [addr mem-refs]} (find-section-in-memory section)
-                               offset (:st_value relocation-symbol)
-                               target-addr (+ addr offset)]
-                           (swap! mem-refs conj section-addr)
-                           (println "local" addr offset)
-                           target-addr)
-                         nil)]
-              (do-relocation target relocation-entry section-addr target-addr)))))))
-  ;;  If existing back refs to sym, update their reloc entries
-  (throw-unresolved-symbol symbol-name))
+      (let [linked
+            (for [{:keys [section global-symbols section-rels rels obj-file] :as section-info} @to-link]
+              (let [{:keys [sh_size data]} section
+                    data-len (if data (.Length data) 0)
+                    zero-len (- sh_size data-len)]
+                (println (:filename obj-file) (:name section) sh_size
+                         data-len)
+                (when linker
+                  (let [addr (alloc-mem linker sh_size)
+                        section-info (merge section-info
+                                            {:addr addr
+                                             :size sh_size})]
+                    (when (> data-len 0) (write-mem linker addr data))
+                    (when (> zero-len 0) (write-mem linker (+ addr data-len) zero-len))
+                    
+                    (swap! (get-data) assoc-in [:section-table section]
+                           section-info)
+                    (doseq [{:keys [name offset size sections rels] :as sym-info} global-symbols]
+                      (println "updating symbol" name)
+                      (swap! (get-data) update-in [:symbol-table name] merge sym-info)
+                      (doseq [back-ref (:refs (find-sym-in-memory name))]
+                        ;; update back references to this symbol
+                        ;; with the new info
+                        ))
+
+                    
+                    ;; find all global symbols in this section, and
+                    ;; update their ref in the symbol table
+                    ;; if there are pieces of code that refer to those
+                    ;; symbols, update their relocation entries
+                    
+                    section-info))))]
+       ;; TODO have two relocation sections - one that relocated based
+        ;; on symbols sending their back references to the symbols
+        ;; that are being targeted (making sure offsets are correctly adjusted), and the other one relocating based
+        ;; on sections with some reference to the section kept
+        ;; somewhere for removal of that section from memory when it
+        ;; is no longer being referenced
+        (doseq [{:keys [rels section addr]} linked]
+          (doseq [{:keys [target] :as rel} rels]
+            (let [target-addr
+                  (if (string? target)
+                    (let [mem-sym (find-sym-in-memory target)]
+                      (swap! mem-sym update-in [:refs] conj )
+                      (:addr mem-sym))
+                    (let [{:keys [symbol target-section]} target
+                          {:keys [addr]} (find-section-in-memory target-section)]
+                      (+ (:st_value symbol) addr)))]
+              (do-relocation linker (dissoc rel :target) addr target-addr)))))
+      (comment
+        (let [updated-symbols (atom #{})
+              newly-written
+              (doall
+               (for [[section {:keys [rel-entries obj-file section-idx]}] @to-link]
+                 (let [{:keys [sh_size data]} section
+                       data-len (if data (.Length data) 0)
+                       zero-len (- sh_size data-len)]
+                   (println (:filename obj-file) (:name section) sh_size
+                            data-len)
+                   (when target
+                     (let [addr (alloc-mem target sh_size)]
+                       (when (> data-len 0) (write-mem target addr data))
+                       (when (> zero-len 0) (write-mem target (+ addr data-len) zero-len))
+                       (swap! (get-data) assoc-in [:section-table section]
+                              {:addr addr :size sh_size})
+                       (let [global-symbols (elf/find-global-symbols obj-file)
+                             section-symbols
+                             (filter (fn [sym] (= (:st_shndx sym) section-idx))
+                                     global-symbols)]
+                         (doseq [{:keys [name st_value st_size]} section-symbols]
+                           (when name
+                             (swap! updated-symbols conj name)
+                             (swap! (get-data) update-in [:symbol-table name]
+                                    merge
+                                    {:addr (+ addr st_value)
+                                     :size st_size}))))
+                       ;; find all global symbols in this section, and
+                       ;; update their ref in the symbol table
+                       ;; if there are pieces of code that refer to those
+                       ;; symbols, update their relocation entries
+                       {:section section
+                        :rel-entries rel-entries
+                        :obj-file obj-file
+                        :addr addr
+                        :size sh_size})))))]
+          ;; Updated references to updated symbols
+          (doseq [sym updated-symbols]
+            (let [{:keys [addr refs]} (find-sym-in-memory sym)]
+              (doseq [[sym-name {:keys [addr rel-entries]}] refs]
+                (do-relocation target relocation-entry section-addr target-addr))))
+          ;;  Perform relocations on newly written sections
+          (doseq [{:keys [rel-entries addr size]} newly-written]
+            (doseq [{:keys [relocation-symbol relocation-entry relocation-target]} rel-entries]
+              (let [section-addr addr
+                    target-addr (case (:st_bind (:st_info relocation-symbol))
+                                  :STB_GLOBAL
+                                  (let [{:keys [addr refs]} (find-sym-in-memory (:name relocation-symbol))]
+                                    addr)
+                                  :STB_LOCAL
+                                  (let [section (find-sym-section (:data relocation-target))
+                                        {:keys [addr mem-refs]} (find-section-in-memory section)
+                                        offset (:st_value relocation-symbol)
+                                        target-addr (+ addr offset)]
+                                    (swap! mem-refs conj section-addr)
+                                    (println "local" addr offset)
+                                    target-addr)
+                                  nil)]
+                (do-relocation target relocation-entry section-addr target-addr)))))))
+    ;;  If existing back refs to sym, update their reloc entries
+    (throw-unresolved-symbol symbol-name)))
 
 
 
