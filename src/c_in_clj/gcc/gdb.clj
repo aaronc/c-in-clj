@@ -169,7 +169,7 @@
                       (println "gdb:" line)
                       (prn res)))))
       (catch Object ex
-        (println "Error"))))
+        (println "Error:" (.Data args)))))
 
 (defn- wrap-gdb-data-received [callbacks]
   (fn on-gdb-data-received [sender args]

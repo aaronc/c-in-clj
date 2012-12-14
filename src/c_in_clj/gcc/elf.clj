@@ -415,7 +415,8 @@ specified position."
 
 (defn filter-data-symbols [global-symbols]
   (filter
-   (fn [sym] (< (get-in sym [:st_shndx]) SHN_LORESERVE))
+   (fn [sym] (let [st_shndx (get-in sym [:st_shndx])]
+              (and (number? st_shndx) (< st_shndx SHN_LORESERVE))))
    global-symbols))
 
 (defn filter-abs-symbols [global-symbols]
