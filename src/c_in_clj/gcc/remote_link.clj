@@ -35,6 +35,7 @@
       (catch Object ex
         (println "Error" ex)))))
 
+
 (defn- find-sym-rel-sections [obj-file st_shndx]
   (when (number? st_shndx)
     (filter
@@ -139,6 +140,12 @@
   (swap! (get-data) merge {:symbol-table nil :section-table nil})
   nil)
 
+(defn- remove-sym-ref [referencing-symbol referenced-symbol]
+  (let [{:keys [referenced-by]} (find-sym-in-memory referenced-symbol)]
+    (swap! referenced-by disj referencing-symbol)))
+
+(defn- remove-section-ref [referencing-symbol target-section])
+
 (defn link-symbol [symbol-name linker]
   (println "Trying to link" symbol-name)
   ;; Find sym in cache
@@ -159,107 +166,125 @@
                   (let [addr (alloc-mem linker sh_size)
                         section-info (merge section-info
                                             {:addr addr
-                                             :size sh_size})]
+                                             :size sh_size
+                                             :referenced-by (atom #{})})]
                     (when (> data-len 0) (write-mem linker addr data))
                     (when (> zero-len 0) (write-mem linker (+ addr data-len) zero-len))
-                    
                     (swap! (get-data) assoc-in [:section-table section]
                            section-info)
                     (doseq [{:keys [name offset size sections rels] :as sym-info} global-symbols]
                       (println "updating symbol" name)
-                      (swap! (get-data) update-in [:symbol-table name] merge sym-info)
-                      (doseq [back-ref (:refs (find-sym-in-memory name))]
-                        ;; update back references to this symbol
-                        ;; with the new info
-                        ))
-
-                    
+                      ;; Updating existing symbol references
+                      (if-let [{:keys [rels]}
+                               (get-in @(get-data) [:symbol-table name])]
+                        (doseq [{:keys [target]} rels]
+                          (if (string? target)
+                            (remove-sym-ref name target)
+                            (remove-section-ref name target)))
+                        (swap! (get-data) assoc-in [:symbol-table name]
+                               {:referenced-by (atom #{})}))
+                      (swap! (get-data) update-in [:symbol-table name] merge sym-info))
                     ;; find all global symbols in this section, and
                     ;; update their ref in the symbol table
                     ;; if there are pieces of code that refer to those
                     ;; symbols, update their relocation entries
                     
                     section-info))))]
+        
+        (doseq [{:keys [section-rels global-symbols section addr]} linked]
+          (doseq [{:keys [name rels]} global-symbols]
+            (doseq [{:keys [target]} rels]
+              (if (string? target)
+                (println "rel target:" target)
+                (println "rel target:" (keys target))))
+            (doseq [back-ref @(:referenced-by (find-sym-in-memory name))]
+              ;; TODO update back references to this symbol
+              ;; with the new info
+              )))
        ;; TODO have two relocation sections - one that relocated based
         ;; on symbols sending their back references to the symbols
         ;; that are being targeted (making sure offsets are correctly adjusted), and the other one relocating based
         ;; on sections with some reference to the section kept
         ;; somewhere for removal of that section from memory when it
         ;; is no longer being referenced
-        (doseq [{:keys [rels section addr]} linked]
-          (doseq [{:keys [target] :as rel} rels]
-            (let [target-addr
-                  (if (string? target)
-                    (let [mem-sym (find-sym-in-memory target)]
-                      (swap! mem-sym update-in [:refs] conj )
-                      (:addr mem-sym))
-                    (let [{:keys [symbol target-section]} target
-                          {:keys [addr]} (find-section-in-memory target-section)]
-                      (+ (:st_value symbol) addr)))]
-              (do-relocation linker (dissoc rel :target) addr target-addr)))))
-      (comment
-        (let [updated-symbols (atom #{})
-              newly-written
-              (doall
-               (for [[section {:keys [rel-entries obj-file section-idx]}] @to-link]
-                 (let [{:keys [sh_size data]} section
-                       data-len (if data (.Length data) 0)
-                       zero-len (- sh_size data-len)]
-                   (println (:filename obj-file) (:name section) sh_size
-                            data-len)
-                   (when target
-                     (let [addr (alloc-mem target sh_size)]
-                       (when (> data-len 0) (write-mem target addr data))
-                       (when (> zero-len 0) (write-mem target (+ addr data-len) zero-len))
-                       (swap! (get-data) assoc-in [:section-table section]
-                              {:addr addr :size sh_size})
-                       (let [global-symbols (elf/find-global-symbols obj-file)
-                             section-symbols
-                             (filter (fn [sym] (= (:st_shndx sym) section-idx))
-                                     global-symbols)]
-                         (doseq [{:keys [name st_value st_size]} section-symbols]
-                           (when name
-                             (swap! updated-symbols conj name)
-                             (swap! (get-data) update-in [:symbol-table name]
-                                    merge
-                                    {:addr (+ addr st_value)
-                                     :size st_size}))))
-                       ;; find all global symbols in this section, and
-                       ;; update their ref in the symbol table
-                       ;; if there are pieces of code that refer to those
-                       ;; symbols, update their relocation entries
-                       {:section section
-                        :rel-entries rel-entries
-                        :obj-file obj-file
-                        :addr addr
-                        :size sh_size})))))]
-          ;; Updated references to updated symbols
-          (doseq [sym updated-symbols]
-            (let [{:keys [addr refs]} (find-sym-in-memory sym)]
-              (doseq [[sym-name {:keys [addr rel-entries]}] refs]
-                (do-relocation target relocation-entry section-addr target-addr))))
-          ;;  Perform relocations on newly written sections
-          (doseq [{:keys [rel-entries addr size]} newly-written]
-            (doseq [{:keys [relocation-symbol relocation-entry relocation-target]} rel-entries]
-              (let [section-addr addr
-                    target-addr (case (:st_bind (:st_info relocation-symbol))
-                                  :STB_GLOBAL
-                                  (let [{:keys [addr refs]} (find-sym-in-memory (:name relocation-symbol))]
-                                    addr)
-                                  :STB_LOCAL
-                                  (let [section (find-sym-section (:data relocation-target))
-                                        {:keys [addr mem-refs]} (find-section-in-memory section)
-                                        offset (:st_value relocation-symbol)
-                                        target-addr (+ addr offset)]
-                                    (swap! mem-refs conj section-addr)
-                                    (println "local" addr offset)
-                                    target-addr)
-                                  nil)]
-                (do-relocation target relocation-entry section-addr target-addr)))))))
+        ;; (doseq [{:keys [rels section addr]} linked]
+        ;;   (doseq [{:keys [target] :as rel} rels]
+        ;;     (let [target-addr
+        ;;           (if (string? target)
+        ;;             (let [mem-sym (find-sym-in-memory target)]
+        ;;               (swap! mem-sym update-in [:refs] conj )
+        ;;               (:addr mem-sym))
+        ;;             (let [{:keys [symbol target-section]} target
+        ;;                   {:keys [addr]} (find-section-in-memory target-section)]
+        ;;               (+ (:st_value symbol) addr)))]
+        ;;       (do-relocation linker (dissoc rel :target) addr target-addr)))))
+      ;; (comment
+      ;;   (let [updated-symbols (atom #{})
+      ;;         newly-written
+      ;;         (doall
+      ;;          (for [[section {:keys [rel-entries obj-file section-idx]}] @to-link]
+      ;;            (let [{:keys [sh_size data]} section
+      ;;                  data-len (if data (.Length data) 0)
+      ;;                  zero-len (- sh_size data-len)]
+      ;;              (println (:filename obj-file) (:name section) sh_size
+      ;;                       data-len)
+      ;;              (when target
+      ;;                (let [addr (alloc-mem target sh_size)]
+      ;;                  (when (> data-len 0) (write-mem target addr data))
+      ;;                  (when (> zero-len 0) (write-mem target (+ addr data-len) zero-len))
+      ;;                  (swap! (get-data) assoc-in [:section-table section]
+      ;;                         {:addr addr :size sh_size})
+      ;;                  (let [global-symbols (elf/find-global-symbols obj-file)
+      ;;                        section-symbols
+      ;;                        (filter (fn [sym] (= (:st_shndx sym) section-idx))
+      ;;                                global-symbols)]
+      ;;                    (doseq [{:keys [name st_value st_size]} section-symbols]
+      ;;                      (when name
+      ;;                        (swap! updated-symbols conj name)
+      ;;                        (swap! (get-data) update-in [:symbol-table name]
+      ;;                               merge
+      ;;                               {:addr (+ addr st_value)
+      ;;                                :size st_size}))))
+      ;;                  ;; find all global symbols in this section, and
+      ;;                  ;; update their ref in the symbol table
+      ;;                  ;; if there are pieces of code that refer to those
+      ;;                  ;; symbols, update their relocation entries
+      ;;                  {:section section
+      ;;                   :rel-entries rel-entries
+      ;;                   :obj-file obj-file
+      ;;                   :addr addr
+      ;;                   :size sh_size})))))]
+      ;;     ;; Updated references to updated symbols
+      ;;     (doseq [sym updated-symbols]
+      ;;       (let [{:keys [addr refs]} (find-sym-in-memory sym)]
+      ;;         (doseq [[sym-name {:keys [addr rel-entries]}] refs]
+      ;;           (do-relocation target relocation-entry section-addr target-addr))))
+      ;;     ;;  Perform relocations on newly written sections
+      ;;     (doseq [{:keys [rel-entries addr size]} newly-written]
+      ;;       (doseq [{:keys [relocation-symbol relocation-entry relocation-target]} rel-entries]
+      ;;         (let [section-addr addr
+      ;;               target-addr (case (:st_bind (:st_info relocation-symbol))
+      ;;                             :STB_GLOBAL
+      ;;                             (let [{:keys [addr refs]} (find-sym-in-memory (:name relocation-symbol))]
+      ;;                               addr)
+      ;;                             :STB_LOCAL
+      ;;                             (let [section (find-sym-section (:data relocation-target))
+      ;;                                   {:keys [addr mem-refs]} (find-section-in-memory section)
+      ;;                                   offset (:st_value relocation-symbol)
+      ;;                                   target-addr (+ addr offset)]
+      ;;                               (swap! mem-refs conj section-addr)
+      ;;                               (println "local" addr offset)
+      ;;                               target-addr)
+      ;;                             nil)]
+      ;;           (do-relocation target relocation-entry section-addr target-addr))))))
+      ))
     ;;  If existing back refs to sym, update their reloc entries
     (throw-unresolved-symbol symbol-name)))
 
-
+;; (cache-obj-file "c:/tmp/test1.elf")
+;; (cache-obj-dir "c:/tmp/de0-nano-bsp")
+;; (link-symbol "alt_putstr" null-target)
+;; (debug-clear)
 
 
 
