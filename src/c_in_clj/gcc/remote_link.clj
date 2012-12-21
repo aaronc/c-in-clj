@@ -14,6 +14,7 @@
   (do-relocation [this rela section-addr target-addr])
   (alloc-mem [this size])
   (write-mem [this addr bytes])
+  (free-mem [this addr])
   (zero-mem [this addr count]))
 
 (defn cache-obj-file [filename & {:keys [cache-locals]}]
@@ -85,7 +86,7 @@
                                       (<= r_offset (+ st_value st_size))))
                                    rels)
                   sym-rels (for [rel sym-rels]
-                             (assoc rel :r_offset (- (:r_offset rel) st_value)))]
+                             (update-in rel [:r_offset] - st_value))]
               {:name name
                :offset st_value
                :size st_shndx
@@ -134,6 +135,8 @@
       (println "Relocating" rela section-addr target-addr))
     (alloc-mem [this count] (rand-int Int32/MaxValue))
     (write-mem [this addr bytes])
+    (free-mem [this addr]
+      (println "Freeing" addr))
     (zero-mem [this addr count])))
 
 (defn debug-clear []
@@ -144,7 +147,12 @@
   (let [{:keys [referenced-by]} (find-sym-in-memory referenced-symbol)]
     (swap! referenced-by disj referencing-symbol)))
 
-(defn- remove-section-ref [referencing-symbol target-section])
+(defn- remove-section-ref [linker referencing-symbol target-section]
+  (let [{:keys [referenced-by addr]} (find-section-in-memory target-section)]
+    (swap! referenced-by disj referencing-symbol)
+    (when (empty? @referenced-by)
+      (free-mem linker addr)
+      (swap! (get-data) update-in [:section-table] dissoc target-section))))
 
 (defn link-symbol [symbol-name linker]
   (println "Trying to link" symbol-name)
@@ -180,7 +188,7 @@
                         (doseq [{:keys [target]} rels]
                           (if (string? target)
                             (remove-sym-ref name target)
-                            (remove-section-ref name target)))
+                            (remove-section-ref linker name target)))
                         (swap! (get-data) assoc-in [:symbol-table name]
                                {:referenced-by (atom #{})}))
                       (swap! (get-data) update-in [:symbol-table name] merge sym-info))
@@ -193,7 +201,7 @@
         
         (doseq [{:keys [section-rels global-symbols section addr]} linked]
           (doseq [{:keys [name rels]} global-symbols]
-            (doseq [{:keys [target]} rels]
+            (doseq [{:keys [target] :as rel} rels]
               (if (string? target)
                 (println "rel target:" target)
                 (println "rel target:" (keys target))))
@@ -285,7 +293,3 @@
 ;; (cache-obj-dir "c:/tmp/de0-nano-bsp")
 ;; (link-symbol "alt_putstr" null-target)
 ;; (debug-clear)
-
-
-
-

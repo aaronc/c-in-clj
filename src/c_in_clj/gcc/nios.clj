@@ -116,3 +116,6 @@
 (defn continue []
   (gre "c  ll"))
 
+
+(defn create-nios-target []
+  (reify link/IRemoteLinkerTarget))
