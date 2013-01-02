@@ -88,34 +88,103 @@
       ;;(link/set-symbol-addr name st_value)
       (println name))))
 
-(defn bootstrap-nios [elf-filename]
-  (let [port (+ 4444 (rand-int 5555))
-        gdb-server (Process/Start
-                    (nios-cmd-shell-path)
-                    (str "nios2-gdb-server --tcpport " port))
-        gdb-client (gdb/start-gdb (nios-cmd-shell-path) "nios2-elf-gdb --interpreter=mi")]
-    (binding [gdb/*gdb-client* gdb-client]
-      (gdb/gdb-connect-localhost port)
-      ;;(link/cache-obj-file elf-filename)
-      (add-bootstrap-sym-refs elf-filename)
-      (gde "-file-exec-and-symbols " elf-filename)
-      (gde "-target-download")
-      )
-    ;;(gdb/kill-gdb gdb-client)
-    ))
+(comment
+  (defn bootstrap-nios [elf-filename]
+    (let [port (+ 4444 (rand-int 5555))
+          gdb-server (Process/Start
+                      (nios-cmd-shell-path)
+                      (str "nios2-gdb-server --tcpport " port))
+          gdb-client (gdb/start-gdb (nios-cmd-shell-path) "nios2-elf-gdb --interpreter=mi")]
+      (binding [gdb/*gdb-client* gdb-client]
+        (gdb/gdb-connect-localhost port)
+        ;;(link/cache-obj-file elf-filename)
+        (add-bootstrap-sym-refs elf-filename)
+        (gde "-file-exec-and-symbols " elf-filename)
+        (gde "-target-download")
+        )
+      ;;(gdb/kill-gdb gdb-client)
+      )))
 
 (defn send-byte [byte]
   (let [buf (make-array Byte 1)
-        {:keys [stream]} (gdb-server)]
+        {:keys [stream]} (gdb/gdb-server)]
     (aset buf 0 byte)
     (.Write stream buf 0 1)))
 
 (defn stop []
   (send-byte 0x03))
 
-(defn continue []
-  (gre "c  ll"))
+(comment (defn continue []
+           (gre "c  ll")))
 
+(def ^:private nios-relocs (atom {}))
+
+(defn- nios-calc-reloc [R B M X]
+  (bit-or (bit-and (bit-shift-left R B) M)
+          (bit-and X (bit-not M))))
+
+(defmacro nrel [name value overflow-check? rel-addr-expr bit-mask bit-shift]
+  `(swap! nios-relocs assoc ~value
+         {:name ~name
+          :value ~value
+          :overflow-check? ~overflow-check?
+          :bit-mask ~bit-mask
+          :bit-shift ~bit-shift
+          :calc-reloc-fn (fn ~(symbol (str (name name) "-calc-rel"))
+                            [X# ~'S ~'A ~'PC ~'GP]
+                            (let [R# ~rel-addr-expr]
+                              (nios-calc-reloc R# ~bit-shift
+                                               ~bit-mask X#)))}))
+
+(defn- Adj [x]
+  (bit-and
+   (+ (bit-and (bit-shift-right x 16) 0xFFFF)
+      (bit-and (bit-shift-right x 15) 0x1))
+   0xFFFF))
+
+(nrel :R_NIOS2_S16 1 true (+ S A)  0x003FFFC0 6)
+(nrel :R_NIOS2_U16 2 true (+ S A) 0x003FFFC0 6)
+(nrel :R_NIOS2_PCREL16 3 true (- (- (+ S A) 4) PC) 0x003FFFC0 6)
+(nrel :R_NIOS2_CALL26 4 false (bit-shift-right (+ S A) 2) 0xFFFFFFC0 6)
+(nrel :R_NIOS2_IMM5 5 true (bit-and (+ S A) 0x1F) 0x000007C0 6)
+(nrel :R_NIOS2_CACHE_OPX 6 true (bit-and (+ S A) 0x1F)  0x07C00000 22)
+(nrel :R_NIOS2_IMM6 7 true (bit-and (+ S A) 0x3F) 0x00000FC0 6)
+(nrel :R_NIOS2_IMM8 8 true (bit-and (+ S A) 0xFF) 0x00003FC0 6)
+(nrel :R_NIOS2_HI16 9 false (bit-and (bit-shift-right (+ S A) 16) 0xFFFF) 0x003FFFC0 6)
+(nrel :R_NIOS2_LO16 10 false (bit-and (+ S A) 0xFFFF) 0x003FFFC0 6)
+(nrel :R_NIOS2_HIADJ16 11 false (Adj (+ S A)) 0x003FFFC0 6)
+(nrel :R_NIOS2_BFD_RELOC_32 12 false (+ S A) 0xFFFFFFFF 0)
+(nrel :R_NIOS2_BFD_RELOC_16 13 true (bit-and (+ S A) 0xFFFF) 0x0000FFFF 0)
+(nrel :R_NIOS2_BFD_RELOC_8 14 true (bit-and (+ S A) 0xFF) 0x000000FF 0)
+(nrel :R_NIOS2_GPREL 15 false (bit-and (- (+ S A) GP) 0xFFFF) 0x003FFFC0 6)
+;;:R_NIOS2_GNU_VTINHERIT 16
+;;:R_NIOS2_GNU_VTENTRY 17
+;; :R_NIOS2_UJMP 18 false
+;; ((S + A) >> 16) & 0xFFFF,
+;; (S + A + 4) & 0xFFFF
+;; 0x003FFFC0
+;; 6
+;; :R_NIOS2_CJMP
+;; 19
+;; No
+;; ((S + A) >> 16) & 0xFFFF,
+;; (S + A + 4) & 0xFFFF
+;; 0x003FFFC0
+;; 6
+;; :R_NIOS2_CALLR
+;; 20
+;; No
+;; ((S + A) >> 16) & 0xFFFF)
+;; (S + A + 4) & 0xFFFF
+;; 0x003FFFC0
+;; 6
+
+
+(defn- perform-nios-relocation
+  [this rela section-addr target-addr])
 
 (defn create-nios-target []
-  (reify link/IRemoteLinkerTarget))
+  (reify link/IRemoteLinkerTarget
+    (do-relocation [this rela section-addr target-addr]
+      (perform-nios-relocation this rela section-addr target-addr))))
+
