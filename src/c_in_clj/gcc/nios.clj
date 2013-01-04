@@ -4,11 +4,12 @@
    [c-in-clj.gcc.elf :as elf]
    [c-in-clj.gcc.gdb-server :as gdb])
   (:use
-   [c-in-clj.gcc.elf :only [read-elf32]])
-  (:import [System.Diagnostics Process ProcessStartInfo
-            DataReceivedEventHandler]
-           [System.IO Path Directory
-            File]))
+   [c-in-clj.gcc.elf :only [read-elf32]]
+   [c-in-clj.gcc.gdb-server])
+  (:import
+   [System.Diagnostics Process ProcessStartInfo DataReceivedEventHandler]
+   [System.IO Path Directory File]
+   [System.Threading Thread]))
 
 (defn- expand-env [path]
   (Environment/ExpandEnvironmentVariables path))
@@ -66,7 +67,7 @@
       (println (.ReadToEnd (.StandardOutput ps)))
       (link/cache-obj-dir temp-dir))))
 
-(cache-lib-file (expand-env "%SOPC_KIT_NIOS2%/bin/gnu/H-i686-mingw32/nios2-elf/lib/libsmallc.a"))
+;;(cache-lib-file (expand-env "%SOPC_KIT_NIOS2%/bin/gnu/H-i686-mingw32/nios2-elf/lib/libsmallc.a"))
 
 (defn nios-config []
   {:bsp-path "c:/tmp/de0-nano-bsp"})
@@ -80,13 +81,15 @@
     (run-gcc gcc-args {:env {"C_INCLUDE_PATH" include-path}
                        :work-dir (Path/GetDirectoryName filename)})))
 
-(defn- add-bootstrap-sym-refs [elf-filename]
+(defn- bootstrap-elf [elf-filename]
   (let [elf (elf/read-elf32 elf-filename)
         global-symbols (elf/find-global-symbols elf)
         data-symbols (elf/filter-data-symbols global-symbols)]
-    (doseq [{:keys [name st_value]} data-symbols]
-      ;;(link/set-symbol-addr name st_value)
-      (println name))))
+    (doseq [{:keys [p_type p_offset p_vaddr p_paddr p_filesz p_memsz p_flags p_align data] :as phdr} (:program-headers elf)]
+      (when (= :PT_LOAD p_type)
+        (gdb/write-mem p_paddr data)))
+    (doseq [{:keys [name st_value st_size st_type st_shndx] :as sym} data-symbols]
+      (link/set-fixed-symbol-addr name st_value st_size))))
 
 (comment
   (defn bootstrap-nios [elf-filename]
@@ -105,15 +108,67 @@
       ;;(gdb/kill-gdb gdb-client)
       )))
 
+(defn bootstrap-nios [elf-filename]
+  (let [port (+ 4444 (rand-int 5555))
+        gdb-server-process (Process/Start
+                            (nios-cmd-shell-path)
+                            (str "nios2-gdb-server --tcpport " port))]
+    (Thread/Sleep 1000)
+    (let [conn (gdb/gdb-server-connect port)]
+      (bootstrap-elf elf-filename))))
+
 (defn send-byte [byte]
   (let [buf (make-array Byte 1)
         {:keys [stream]} (gdb/gdb-server)]
     (aset buf 0 byte)
     (.Write stream buf 0 1)))
 
-(defn stop []
+(defn break []
   (send-byte 0x03))
 
+(defn write-word [addr word]
+  (gdb/write-mem addr (BitConverter/GetBytes (uint word))))
+
+(defn get-scratch-offset []
+  (:addr (link/find-sym-in-memory "scratch_area")))
+
+(defn write-scratch-word [offset word]
+  (when-let [{:keys [addr size]} (link/find-sym-in-memory "scratch_area")]
+    (when (< offset size)
+      (write-word (+ addr offset) word))))
+
+(defn save-state* [func]
+  (let [regs (gdb/read-regs)]
+    (func)
+    (gdb/write-regs regs)))
+
+(defmacro save-state [& body]
+  `(save-state* (fn [] ~@body)))
+
+(defn set-pc [addr]
+  (gdb/write-reg 0x20 addr))
+
+(defn step-one []
+  (gdb/gre "s"))
+
+(defn invoke-func [name args]
+  (break)
+  (save-state
+   (when-let [{:keys [addr]} (link/find-sym-in-memory name)]
+     (let [call-word (bit-shift-left (bit-shift-right addr 2) 6)
+           nargs (count args)]
+       (write-scratch-word 0 call-word)
+       (if (<= nargs 4)
+         (dotimes [i nargs]
+           (let [arg (nth args i)]
+             (gdb/write-reg (+ 4 i) arg)))
+         (throw (ArgumentException. (str "Too many arguments (" nargs ") for invoke-func"))))
+       (set-pc (get-scratch-offset))
+       (step-one)
+       (read-reg 2)))))
+
+;;(add-bootstrap-sym-refs "c:/tmp/test1.elf")
+;;(bootstrap-nios "c:/tmp/test1.elf")
 (comment (defn continue []
            (gre "c  ll")))
 

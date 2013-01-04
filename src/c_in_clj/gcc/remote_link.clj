@@ -7,7 +7,7 @@
 
 (def ^:private linker-data (atom {}))
 
-(defn- get-data []
+(defn get-data []
   (or (:data (gdb/gdb-server)) linker-data))
 
 (defprotocol IRemoteLinkerTarget
@@ -104,7 +104,7 @@
 (defn- find-sym-in-cache [symbol-name]
   (get-in @(get-data) [:symbol-cache symbol-name]))
 
-(defn- find-sym-in-memory [symbol-name]
+(defn find-sym-in-memory [symbol-name]
   (get-in @(get-data) [:symbol-table symbol-name]))
 
 (defn- find-section-in-memory [section]
@@ -153,6 +153,12 @@
     (when (empty? @referenced-by)
       (free-mem linker addr)
       (swap! (get-data) update-in [:section-table] dissoc target-section))))
+
+(defn set-fixed-symbol-addr [name addr size]
+  (println name "@" addr)
+  (swap! (get-data) assoc-in [:symbol-table name]
+         {:addr addr :size size
+          :fixed true}))
 
 (defn link-symbol [symbol-name linker]
   (println "Trying to link" symbol-name)
