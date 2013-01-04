@@ -23,97 +23,97 @@
                   (elf/find-sym-table elf)
                   (elf/find-global-symbols elf))
         defined-symbols (elf/filter-data-symbols symbols)]
-    (doseq [{:keys [name] :as sym} defined-symbols]
-      (when name
-        (println "Caching" name)
-        (swap! (get-data) assoc-in [:symbol-cache name]
-               {:symdata sym :obj-file elf})))))
+(doseq [{:keys [name] :as sym} defined-symbols]
+  (when name
+    (println "Caching" name)
+    (swap! (get-data) assoc-in [:symbol-cache name]
+           {:symdata sym :obj-file elf})))))
 
 (defn cache-obj-dir [path]
-  (doseq [filename (Directory/EnumerateFiles path "*.o" SearchOption/AllDirectories)]
-    (try
-      (cache-obj-file filename)
-      (catch Object ex
-        (println "Error" ex)))))
+(doseq [filename (Directory/EnumerateFiles path "*.o" SearchOption/AllDirectories)]
+(try
+  (cache-obj-file filename)
+  (catch Object ex
+    (println "Error" ex)))))
 
 
 (defn- find-sym-rel-sections [obj-file st_shndx]
-  (when (number? st_shndx)
-    (filter
-     (fn [{:keys [sh_type sh_info] :as section}]
-       (and (or (= :SHT_REL sh_type)
-                (= :SHT_RELA sh_type))
-            (= sh_info st_shndx)))
-     (:sections obj-file))))
+(when (number? st_shndx)
+(filter
+ (fn [{:keys [sh_type sh_info] :as section}]
+   (and (or (= :SHT_REL sh_type)
+            (= :SHT_RELA sh_type))
+        (= sh_info st_shndx)))
+ (:sections obj-file))))
 
 (defn- find-sym-section
-  ([obj-file st_shndx]
-     (when (number? st_shndx)
-       (nth (:sections obj-file) st_shndx))))
+([obj-file st_shndx]
+ (when (number? st_shndx)
+   (nth (:sections obj-file) st_shndx))))
 
 (defn find-sym-section+rels
-  [obj-file st_shndx]
-  {:section (find-sym-section obj-file st_shndx)
-   :rels (find-sym-rel-sections obj-file st_shndx)})
+[obj-file st_shndx]
+{:section (find-sym-section obj-file st_shndx)
+:rels (find-sym-rel-sections obj-file st_shndx)})
 
 
 (defn find-section-globals [obj-file st_shndx]
-  (filter (fn [sym] (= (:st_shndx sym) st_shndx))
-          (elf/find-global-symbols obj-file)))
+(filter (fn [sym] (= (:st_shndx sym) st_shndx))
+      (elf/find-global-symbols obj-file)))
 
 (defn process-section [obj-file st_shndx]
-  (when (number? st_shndx)
-    (let [{:keys [section rels]} (find-sym-section+rels obj-file st_shndx)
-          section-globals (find-section-globals obj-file st_shndx)
-          all-symbols (elf/find-sym-table obj-file)
-          rels (apply concat (map :data rels))
-          rels (for [{:keys [r_info] :as rel} rels]
-                 (let [{:keys [r_sym]} r_info
-                       {:keys [st_info st_shndx] :as rsym} (nth all-symbols r_sym)
-                       target (case (:st_bind st_info)
-                                :STB_GLOBAL (:name rsym)
-                                :STB_LOCAL
-                                {:symbol rsym
-                                 :target-idx st_shndx
-                                 :target-obj obj-file
-                                 :target-section (find-sym-section obj-file st_shndx)}
-                                :STB_WEAK
-                                (:name rsym))]
-                   (assoc rel :target target)))
-          global-symbols (for [{:keys [name st_value st_size]} section-globals]
-            (let [sym-rels (filter (fn [{:keys [r_offset] :as rel}]
-                                 (and (>= r_offset st_value)
-                                      (<= r_offset (+ st_value st_size))))
-                                   rels)
-                  sym-rels (for [rel sym-rels]
-                             (update-in rel [:r_offset] - st_value))]
-              {:name name
-               :offset st_value
-               :size st_shndx
-               :section section
-               :rels sym-rels}))
-          sym-rels (into #{} (apply concat (map :rels global-symbols)))
-          section-rels (set/difference (apply hash-set rels) sym-rels)]
-      {:section section
-       :section-idx st_shndx
-       :section-rels (vec section-rels)
-       :rels rels
-       :global-symbols global-symbols
-       :obj-file obj-file})))
+(when (number? st_shndx)
+(let [{:keys [section rels]} (find-sym-section+rels obj-file st_shndx)
+      section-globals (find-section-globals obj-file st_shndx)
+      all-symbols (elf/find-sym-table obj-file)
+      rels (apply concat (map :data rels))
+      rels (for [{:keys [r_info] :as rel} rels]
+             (let [{:keys [r_sym]} r_info
+                   {:keys [st_info st_shndx] :as rsym} (nth all-symbols r_sym)
+                   target (case (:st_bind st_info)
+                            :STB_GLOBAL (:name rsym)
+                            :STB_LOCAL
+                            {:symbol rsym
+                             :target-idx st_shndx
+                             :target-obj obj-file
+                             :target-section (find-sym-section obj-file st_shndx)}
+                            :STB_WEAK
+                            (:name rsym))]
+               (assoc rel :target target)))
+      global-symbols (for [{:keys [name st_value st_size]} section-globals]
+        (let [sym-rels (filter (fn [{:keys [r_offset] :as rel}]
+                             (and (>= r_offset st_value)
+                                  (<= r_offset (+ st_value st_size))))
+                               rels)
+              sym-rels (for [rel sym-rels]
+                         (update-in rel [:r_offset] - st_value))]
+          {:name name
+           :offset st_value
+           :size st_shndx
+           :section section
+           :rels sym-rels}))
+      sym-rels (into #{} (apply concat (map :rels global-symbols)))
+      section-rels (set/difference (apply hash-set rels) sym-rels)]
+  {:section section
+   :section-idx st_shndx
+   :section-rels (vec section-rels)
+   :rels rels
+   :global-symbols global-symbols
+   :obj-file obj-file})))
 
 (defn- find-sym-in-cache [symbol-name]
-  (get-in @(get-data) [:symbol-cache symbol-name]))
+(get-in @(get-data) [:symbol-cache symbol-name]))
 
 (defn find-sym-in-memory [symbol-name]
-  (get-in @(get-data) [:symbol-table symbol-name]))
+(get-in @(get-data) [:symbol-table symbol-name]))
 
 (defn- find-section-in-memory [section]
-  (get-in @(get-data) [:section-table section]))
+(get-in @(get-data) [:section-table section]))
 
 (defn- throw-unresolved-symbol [name]
-  (throw (ex-info
-          (str "Unresolved symbol " name)
-          {:type ::unresolved-symbol :name name})))
+(throw (ex-info
+      (str "Unresolved symbol " name)
+      {:type ::unresolved-symbol :name name})))
 
 (defn resolve-sym-refs [obj-file st_shndx to-link]
   (let [{:keys [section rels] :as section-info}

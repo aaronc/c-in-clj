@@ -26,8 +26,7 @@
           data (or (second (re-matches #"\+\$(.*)\#.." raw-data)) raw-data)]
       (println "<-" data)
       (reset! res-data data)
-      (when (or (.StartsWith raw-data "+") (.StartsWith raw-data "-"))
-        (.Set wait-handle))
+      (.Set wait-handle)
       (.BeginRead stream read-buf 0 read-buf-size
                    callback
                    connection))
@@ -55,11 +54,21 @@
     (reset! gdb-server-instance connection)))
 
 (defn- calc-checksum [cmd]
-  (let [sum (apply + (map char cmd))]
+  (let [sum (apply + (map byte cmd))]
     (mod sum 256)))
 
+(defn gdb-reset-reply []
+  (.Reset (:wait-handle (gdb-server))))
+
+(defn gdb-wait-reply []
+  (let [{:keys [wait-handle res-data]} (gdb-server)]
+    (when-not (.WaitOne wait-handle 1000)
+      (throw (TimeoutException. "gdb server timed out")))
+    @res-data))
+
 (defn gre [cmd]
-  (let [{:keys [stream wait-handle res-data]} (gdb-server)
+  (gdb-reset-reply)
+  (let [{:keys [stream]} (gdb-server)
         checksum (calc-checksum cmd)
         data (format "$%s#%x2" cmd checksum)
         bytes (.GetBytes Encoding/ASCII data)
@@ -68,9 +77,7 @@
                         data)]
     (println "->" data-fragment)
     (.Write stream bytes 0 (.Length bytes))
-    (when-not (.WaitOne wait-handle 1000)
-      (throw (TimeoutException. "gdb server timed out")))
-    @res-data))
+    (gdb-wait-reply)))
 
 (defn read-mem [addr length]
   (gre (str "m"
@@ -85,15 +92,21 @@
       (fn [i sub] (write-mem (+ addr (* i 200)) sub))
       (partition-all 200 bytes)))
     (gre (str "M"
-              (.ToString addr "x")
+              (.ToString addr "x8")
               ","
-              (.ToString (count bytes) "x")
+              (.ToString (count bytes) "x4")
               ":"
               (apply str (map (fn [x] (.ToString (byte x) "x2")) bytes))))))
 
+(defn- bytestr->ulong [bytestr]
+  (let [bytes (map #(apply str %) (partition 2 bytestr))
+        bytes (reverse bytes)
+        ulong-str (apply str (apply concat bytes))
+        ]
+    (UInt64/Parse ulong-str NumberStyles/HexNumber)))
+
 (defn read-reg [n]
-  (UInt64/Parse (gre (str "p" (.ToString n "x")))
-                NumberStyles/HexNumber))
+  (bytestr->ulong (gre (str "p" (.ToString n "x")))))
 
 (defn get-word-size [] (:word-size (gdb-server)))
 
@@ -108,7 +121,7 @@
     (for [reg regs]
       (if (.Contains reg "x")
         nil
-        (UInt64/Parse (apply str reg) NumberStyles/HexNumber)))))
+        (bytestr->ulong (apply str reg))))))
 
 (defn write-regs [reg-values]
   (gre (apply str
