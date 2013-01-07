@@ -1,8 +1,13 @@
+;;(add-ns-load-mapping "clj_parse" "c:/users/arc/dev/mtreader/apps/pharmaseqcommon/clj-parse/src/clj_parse")
+;;(add-ns-load-mapping "c_in_clj" "c:/users/arc/dev/mtreader/apps/pharmaseqcommon/c-in-clj/src/c_in_clj")
+
 (ns c-in-clj.gcc.gdb-server
   "Low level gdb remote protocol functions"
   (:import
    [System.Net.Sockets TcpClient]
-   [System.Text Encoding]))
+   [System.Text Encoding]
+   [System.Threading Thread EventWaitHandle EventResetMode]
+   [System.Globalization NumberStyles]))
 
 (def gdb-server-instance (atom nil))
 
@@ -11,46 +16,114 @@
 (defn gdb-server []
   (or *gdb-server* @gdb-server-instance))
 
+(def ^:private ^:const read-buf-size 8192)
+
 (defn on-read [res]
   (try
-    (let [{:keys [read-buf callback stream] :as connection} (.AsyncState res)
+    (let [{:keys [read-buf callback stream wait-handle res-data] :as connection} (.AsyncState res)
           read (.EndRead stream res)
-          data (.GetString Encoding/ASCII read-buf 0 read)]
+          raw-data (.GetString Encoding/ASCII read-buf 0 read)
+          data (or (second (re-matches #"\+\$(.*)\#.." raw-data)) raw-data)]
       (println "<-" data)
-      (.BeginRead stream read-buf 0 1024
+      (reset! res-data data)
+      (.Set wait-handle)
+      (.BeginRead stream read-buf 0 read-buf-size
                    callback
                    connection))
     (catch Object ex
       (println "Error" ex))))
 
 (defn gdb-server-connect
-  ([port] (gdb-server-connect "localhost" port))
-  ([host port]
-     (let [client (TcpClient. host port)
-           stream (.GetStream client)
-           read-buf (make-array Byte 1024)
-           callback (gen-delegate AsyncCallback [res] (on-read res))
-           connection {:client client
-                       :stream stream
-                       :read-buf read-buf
-                       :callback callback
-                       :data (atom {})}]
-       (.BeginRead stream read-buf 0 1024
-                   callback
-                   connection)
-       (reset! gdb-server-instance connection))))
+  [port & {:keys [host word-size] :as opts}]
+  (let [host (or host "localhost")
+        client (TcpClient. host port)
+        stream (.GetStream client)
+        read-buf (make-array Byte read-buf-size)
+        callback (gen-delegate AsyncCallback [res] (on-read res))
+        connection {:client client
+                    :stream stream
+                    :read-buf read-buf
+                    :callback callback
+                    :data (atom {})
+                    :word-size (or word-size 4)
+                    :res-data (atom nil)
+                    :wait-handle (EventWaitHandle. false EventResetMode/AutoReset)}]
+    (.BeginRead stream read-buf 0 read-buf-size
+                callback
+                connection)
+    (reset! gdb-server-instance connection)))
 
 (defn- calc-checksum [cmd]
-  (let [sum (apply + (map char cmd))]
+  (let [sum (apply + (map byte cmd))]
     (mod sum 256)))
 
+(defn gdb-reset-reply []
+  (.Reset (:wait-handle (gdb-server))))
+
+(defn gdb-wait-reply []
+  (let [{:keys [wait-handle res-data]} (gdb-server)]
+    (when-not (.WaitOne wait-handle 1000)
+      (throw (TimeoutException. "gdb server timed out")))
+    @res-data))
+
 (defn gre [cmd]
+  (gdb-reset-reply)
   (let [{:keys [stream]} (gdb-server)
         checksum (calc-checksum cmd)
-        data (format "$%s#%x" cmd checksum)
-        bytes (.GetBytes Encoding/ASCII data)]
-    (println "->" data)
-    (.Write stream bytes 0 (.Length bytes))))
+        data (format "$%s#%x2" cmd checksum)
+        bytes (.GetBytes Encoding/ASCII data)
+        data-fragment (if (> (.Length data) 1024)
+                        (str (.Substring data 0 1024) "...")
+                        data)]
+    (println "->" data-fragment)
+    (.Write stream bytes 0 (.Length bytes))
+    (gdb-wait-reply)))
 
+(defn read-mem [addr length]
+  (gre (str "m"
+            (.ToString addr "x")
+            ","
+            (.ToString length "x"))))
 
+(defn write-mem [addr bytes]
+  (if (> (count bytes) 200)
+    (doall
+     (map-indexed
+      (fn [i sub] (write-mem (+ addr (* i 200)) sub))
+      (partition-all 200 bytes)))
+    (gre (str "M"
+              (.ToString addr "x8")
+              ","
+              (.ToString (count bytes) "x4")
+              ":"
+              (apply str (map (fn [x] (.ToString (byte x) "x2")) bytes))))))
 
+(defn- bytestr->ulong [bytestr]
+  (let [bytes (map #(apply str %) (partition 2 bytestr))
+        bytes (reverse bytes)
+        ulong-str (apply str (apply concat bytes))
+        ]
+    (UInt64/Parse ulong-str NumberStyles/HexNumber)))
+
+(defn read-reg [n]
+  (bytestr->ulong (gre (str "p" (.ToString n "x")))))
+
+(defn get-word-size [] (:word-size (gdb-server)))
+
+(defn- print-reg-value [r] (.ToString r (str "x" (* 2 (get-word-size)))))
+
+(defn write-reg [n r]
+  (gre (str "p" (.ToString n "x") "=" (print-reg-value r))))
+
+(defn read-regs []
+  (let [res (gre "g")
+        regs (partition (* 2 (get-word-size)) res)]
+    (for [reg regs]
+      (if (.Contains reg "x")
+        nil
+        (bytestr->ulong (apply str reg))))))
+
+(defn write-regs [reg-values]
+  (gre (apply str
+              "G"
+              (for [reg reg-values] (print-reg-value reg)))))

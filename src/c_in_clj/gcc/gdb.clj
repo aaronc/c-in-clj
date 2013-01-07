@@ -1,6 +1,3 @@
-;;(add-ns-load-mapping "clj_parse" "c:/users/arc/dev/mtreader/apps/pharmaseqcommon/clj-parse/src/clj_parse")
-;;(add-ns-load-mapping "c_in_clj" "c:/users/arc/dev/mtreader/apps/pharmaseqcommon/c-in-clj/src/c_in_clj")
-
 (ns c-in-clj.gcc.gdb
   (:use [clj-parse core helpers])
   (:require [clojure.string :as str])
