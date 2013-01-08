@@ -18,10 +18,78 @@
   (create-new-expr [this args])
   (common-denominator-type [this other-type])
   (create-implicit-cast-expr [this expr])
+  (create-explicit-cast-expr [this expr])
   (get-fields [this])
   (create-field-access-expr [this instance-expr field-name]))
 
+(defprotocol IDeclaration
+  (write-decl [this])
+  (write-impl [this])
+  (decl-package [this]))
+
+(defprotocol ICompileContext
+  (write-hook [hook-name expr])
+  (compile-decls [decls source-file-path])
+  (resolve-ext-sym [sym-name])
+  (resolve-ext-type [type-name]))
+
+(def null-compile-context
+  (reify ICompileContext
+    (write-hook [hook-name expr])
+    (compile-decls [decls source-file-path])
+    (resolve-ext-sym [sym-name])
+    (resolve-ext-type [type-name])))
+
+(defrecord Module [name compile-ctxt src-output-path temp-output-path packages symbols types])
+
+(defrecord Package [name module declarations private-symbols private-types])
+
+(defprotocol ILoadContext
+  (load-symbol [package-name symbol-name]))
+
+(def null-loader-context
+  (reify ILoadContext
+    (load-symbol [package-name symbol-name])))
+
+(defrecord RuntimeModule [name loader packages])
+
+(defrecord RuntimePackage [name module])
+
+(def ^:private packages-by-ns (atom {}))
+
+(defn dev-env? []
+  (= (Environment/GetEnvironmentVariable "C_IN_CLJ_DEV") "true"))
+
+(defn create-module [module-name init-compile-ctxt-fn init-load-ctxt-fn {:keys [dev] :as opts}]
+  (if (if (not (nil? dev)) dev (dev-env?))
+    (let [{:keys [src-output-path temp-output-path]} opts
+          ;;TODO default output paths
+          ]
+      (Module. module-name (init-compile-ctxt-fn)
+               src-output-path temp-output-path
+               (atom {}) (atom {}) (atom {})))
+    (RuntimeModule. module-name (init-load-ctxt-fn) (atom {}))))
+
+(defn csource-module [module-name & {:as opts}]
+  (create-module (constantly null-compile-context)
+                 (constantly null-loader-context)
+                 opts))
+
+(defn cpackage [module package-name]
+  (swap! packages-by-ns assoc *ns*
+         (cond (instance? Module module)
+               (Package. package-name module (atom []) (atom {}) (atom {}))
+               (instance? RuntimeModule module)
+               (RuntimePackage. package-name module))))
+
+(defn get-package [])
+
+(defn get-package-name [])
+
+(defn dev-mode? [])
+
 (def ^:private ^:dynamic *locals* nil)
+(def ^:private ^:dynamic *locals-decls* nil)
 
 (defmacro defliteral [name ctype]
   (let [ctype (lookup-type ctype)]
@@ -677,6 +745,9 @@
 (defmacro cstruct [name & members]
   (compile-cstruct name members))
 
-
+;; TODO
+;; typedefs, structs with IExpression write
+;; create define-type fn
+;; void$i32+i64 function pointer syntax
 
 
