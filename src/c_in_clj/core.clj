@@ -1,193 +1,605 @@
 (ns c-in-clj.core
-;;   "A framework for dynamically translating clojure expressions directly into C code.
+  (:require [clojure.string :as str]
+            [clojure.set :as set])
+  (:import
+   [System.IO Path File]))
 
-;; Mapping of clojure s-expressions to their C-language counterparts:
-;; +, -, *, /, mod, inc, post-inc, dec, post-dec
-;; = (==), not= (!=), <, >, <=, >=
-;; or, and
-;; bit-and, bit-or, bit-xor, bit-not, bit-shift-left, bit-shift-right
-;; if, case, do, while, for, case, break, continue, goto, label
-;; sizeof
-;; let
-;; set! (=), and=, or=, xor=
-;; cast
-;; aget, aset
-;; ., ->, ref (&), deref (*)
-;; cpp-mode only: \ (::)
-;; comment
-;; "
-  (:require [clojure.string :as str]))
+(defprotocol IHasType
+  (get-type [this]))
 
-(defprotocol ICModuleContext
-  (init-module [this module-name package-name])
-  (resolve-sym [this sym])
-  (compilefn [this name ret args body])
-  (compilefns [this funcs])
-  (clean [this] [this func]))
+(defprotocol IExpression
+  (write [this])
+  (expr-category [this])
+  (wrap-last [this func]))
 
-(defn null-module-context []
-  (reify
-    ICModuleContext
-    (init-module [this module-name package-name])
-    (resolve-sym [this sym])
-    (compilefn [this name ret args body]
-      (println body))
-    (compilefns [this funcs]
-      (doseq [{:keys [body]} funcs]
-        (println body)))
-    (clean [this])
-    (clean [this func])))
+(defprotocol IField
+  (get-field-type [this])
+  (get-bitfield-width [this]))
 
-(def ^:dynamic *cmodule-context* (atom (null-module-context)))
+(defprotocol IType
+  (write-type [this])
+  (write-decl-expr [this var-name])
+  (is-reference-type? [this])
+  (create-new-expr [this args])
+  (common-denominator-type [this other-type])
+  (create-implicit-cast-expr [this expr])
+  (create-explicit-cast-expr [this expr])
+  (get-fields [this])
+  (create-field-access-expr [this instance-expr field-name]))
 
-(def ^:private cintrinsics (atom {}))
+(defprotocol IDeclaration
+  (write-decl [this])
+  (write-impl [this])
+  (decl-package [this]))
 
-(def ^:dynamic *indent* 0)
+(defrecord CompileSource [source body-source filename])
 
-(def ^:dynamic *header*)
+(defprotocol ICompileContext
+  (write-hook [hook-name expr])
+  (compile-decls [decls compile-source])
+  (resolve-ext-sym [sym-name])
+  (resolve-ext-type [type-name]))
 
-(def ^:dynamic *locals* [])
+(def null-compile-context
+  (reify ICompileContext
+    (write-hook [hook-name expr])
+    (compile-decls [decls source-file-path] {})
+    (resolve-ext-sym [sym-name])
+    (resolve-ext-type [type-name])))
 
-(def ^:private cmodules (atom {}))
+(defrecord Module [name
+                   compile-ctxt
+                   src-output-path
+                   temp-output-path
+                   preamble
+                   cpp-mode
+                   packages
+                   symbols
+                   types])
 
-(def ^:private cmodules-by-ns (atom {}))
+(defrecord Package [name module declarations private-symbols private-types])
 
-(def ^:private defined-types (atom {}))
+(defprotocol ILoadContext
+  (load-symbol [package-name symbol-name]))
 
-(def cmacros (atom {}))
+(def null-loader-context
+  (reify ILoadContext
+    (load-symbol [package-name symbol-name])))
 
-(defmacro cmodule [name]
-  (let [mod (atom {:name name :ns *ns* :includes #{} :headers [] :deftypes {}})]
-    (swap! cmodules assoc name mod)
-    (swap! cmodules-by-ns assoc *ns* mod)
-    nil))
+(defrecord RuntimeModule [name loader packages])
 
-(defn cinclude [header]
-  (when-let [mod (@cmodules-by-ns *ns*)]
-    (let [value (str "<" header ">")]
-      (swap! mod update-in [:includes] conj value)
-      (swap! mod update-in [:headers] conj (str "#include " value)))))
+(defrecord RuntimePackage [name module])
+
+(def ^:private packages-by-ns (atom {}))
+
+(defn dev-env? []
+  (= (Environment/GetEnvironmentVariable "C_IN_CLJ_DEV") "true"))
+
+(def default-c-preamble
+  "#include <stddef.h>\n#include <stdint.h>\n#include <stdbool.h>\n")
+
+(def default-cpp-preamble
+  "#include <cstddef>\n#include <cstdint>\n")
+
+(defn create-module [module-name init-compile-ctxt-fn init-load-ctxt-fn {:keys [dev] :as opts}]
+  (if (if (not (nil? dev)) dev (dev-env?))
+    (let [{:keys [src-output-path temp-output-path cpp-mode preamble]} opts
+          cpp-mode (or cpp-mode false)
+          preamble (or preamble (if cpp-mode
+                                  default-cpp-preamble
+                                  default-c-preamble))
+          ;;TODO default output paths
+          ]
+      (Module. module-name (init-compile-ctxt-fn)
+               src-output-path temp-output-path
+               preamble cpp-mode
+               (atom {}) (atom {}) (atom {})))
+    (RuntimeModule. module-name (init-load-ctxt-fn) (atom {}))))
+
+(defmacro csource-module [module-name & {:as opts}]
+  `(def ~module-name
+     (create-module
+      ~(name module-name)
+      (constantly null-compile-context)
+      (constantly null-loader-context)
+      ~opts)))
+
+(defn cpackage [module package-name]
+  (swap! packages-by-ns assoc *ns*
+         (cond (instance? Module module)
+               (Package. package-name module (atom []) (atom {}) (atom {}))
+               (instance? RuntimeModule module)
+               (RuntimePackage. package-name module))))
+
+(defn get-package [] (get @packages-by-ns *ns*))
+
+(defn dev-mode? [module] (instance? Module module))
+
+(defn- find-index-of [items pred]
+  (loop [[item & more] items
+         idx 0]
+    (when item
+      (if (pred item)
+        idx
+        (recur more (inc idx))))))
+
+(defn package-add-decl [{:keys [declarations] :as package} decl]
+  (let [decl-name (name decl)
+        existing-idx (find-index-of @declarations #(= (name %) decl-name))]
+    (if existing-idx
+      (swap! declarations assoc existing-idx decl)
+      (swap! declarations conj decl))))
+
+(defn module-add-symbol [{:keys [symbols] :as module} decl]
+  (swap! symbols assoc (name decl) decl))
+
+(defn package-add-symbol [{:keys [private-symbols] :as package} decl]
+  (package-add-decl package decl)
+  (if (:private (meta decl))
+    (swap! private-symbols assoc (name decl) decl)
+    (module-add-symbol (:module package) decl)))
+
+(defn module-add-type [{:keys [types] :as module} decl]
+  (swap! types assoc (name decl) decl))
+
+(defn package-add-type [{:keys [private-types] :as package} decl]
+  (package-add-decl package decl)
+  (if (:private (meta decl))
+    (swap! private-types assoc (name decl) decl)
+    (module-add-type (:module package) decl)))
+
+(def ^:private ^:dynamic *locals* nil)
+
+(def ^:private ^:dynamic *local-decls* nil)
+
+(def ^:private ^:dynamic *referenced-decls*)
+
+(def ^:dynamic *dynamic-compile* false)
+
+(declare lookup-type)
+
+(defmacro defliteral [name ctype]
+  (let [ctype (lookup-type ctype)]
+    `(defrecord ~name [value#]
+       IExpression
+       (write [_] (pr-str value#))
+       (expr-category [_] :literal)
+       IHasType
+       (get-type [_] ~ctype))))
+
+(defliteral Int32Literal int32_t)
+(defliteral Int64Literal int64_t)
+(defliteral DoubleLiteral double)
+(defliteral BooleanLiteral bool)
+(defliteral StringLiteral char*)
+
+(def null-literal
+  (reify IExpression
+    (write [this] "NULL")
+    (expr-category [_] :literal)
+    IHasType
+    (get-type [this])))
+
+(def ^:private primitive-types (atom {}))
+
+(def ^:private type-aliases (atom {}))
+
+(defrecord PrimitiveType [type-name]
+  clojure.lang.Named
+  (getName [_] type-name)
+  IType
+  (write-type [_] type-name)
+  (write-decl-expr [_ var-name] (str type-name " " var-name))
+  (is-reference-type? [_] false)
+  (common-denominator-type [_ _]))
+
+(defmacro defprimitive [type-name]
+  (let [type-name (name type-name)]
+    `(swap! primitive-types
+            assoc
+            ~type-name
+            (PrimitiveType. ~type-name))))
+
+(defprimitive void)
+(defprimitive int8_t)
+(defprimitive int16_t)
+(defprimitive int32_t)
+(defprimitive int64_t)
+(defprimitive uint8_t)
+(defprimitive uint16_t)
+(defprimitive uint32_t)
+(defprimitive uint64_t)
+(defprimitive size_t)
+(defprimitive char)
+(defprimitive float)
+(defprimitive double)
+(defprimitive bool)
+
+(defmacro ctype-alias [type-alias type-name]
+  `(swap! type-aliases
+          assoc
+          ~(name type-alias)
+          ~(name type-name)))
+
+(ctype-alias i8 int8_t)
+(ctype-alias i16 int16_t)
+(ctype-alias i32 int32_t)
+(ctype-alias i64 int64_t)
+(ctype-alias u8 uint8_t)
+(ctype-alias u16 uint16_t)
+(ctype-alias u32 uint32_t)
+(ctype-alias u64 uint64_t)
+
+(defrecord PointerType [type]
+  clojure.lang.Named
+  (getName [_] (str (name type) "*"))
+  IType
+  (write-type [_] (str (write-type type) "*"))
+  (write-decl-expr [_ var-name] (str (write-type type) "* " var-name))
+  (is-reference-type? [_] true)
+  (get-fields [_]))
+
+(defrecord AnonymousType [type-name]
+  clojure.lang.Named
+  (getName [_] type-name)
+  IType
+  (write-type [_] type-name)
+  (write-decl-expr [_ var-name] (str type-name " " var-name))
+  (is-reference-type? [_] false))
+
+(defn lookup-type [type-name]
+  (cond
+   (satisfies? IType type-name) type-name
+   (keyword? type-name) (AnonymousType. (name type-name))
+   :default
+    (let [type-name (name type-name)]
+      (if-let [primitive (get @primitive-types type-name)]
+        primitive
+        (if-let [alias (get @type-aliases type-name)]
+          (lookup-type alias)
+          (if (.EndsWith type-name "*")
+            (PointerType. (lookup-type (.Substring type-name 0 (dec (.Length type-name)))))
+            (comment TODO)))))))
+
+(defrecord FunctionParameter [param-name param-type metadata]
+  clojure.lang.Named
+  (getName [_] param-name)
+  IHasType
+  (get-type [_] param-type)
+  IExpression
+  (expr-category [_] :local)
+  (write [_] (write-decl-expr param-type param-name)))
+
+(defn- write-function-type [{:keys [return-type params]}
+                            pointer-depth name?]
+  (str (write-type return-type) " (" name?
+       (apply str (repeat pointer-depth "*")) ")("
+       (str/join ", " (map write params)) ")"))
+
+(defrecord FunctionType [return-type params]
+  IType
+  (write-type [this]
+    (write-function-type this 0 nil))
+  (write-decl-expr [this var-name]
+    (write-function-type this 0 var-name))
+  (is-reference-type? [this] false))
+
+(defn write-function-signature [function-name {:keys [return-type params]}]
+  (str (write-type return-type) " "
+       function-name "(" (str/join ", " (map write params)) ")"))
+
+(defrecord FunctionDeclaration [package function-name function-type body referenced-decls metadata]
+  clojure.lang.Named
+  (getName [this] function-name)
+  IHasType
+  (get-type [this] function-type)
+  IDeclaration
+  (write-decl [this]
+    (str (write-function-signature function-name function-type) ";"))
+  (write-impl [this]
+    (str (write-function-signature function-name function-type) "\n"
+         (write body)))
+  (decl-package [this] package))
+
+(defrecord FunctionCallExpression [func args]
+  IExpression
+  (write [this]
+    (str (name func)
+         "(" (str/join "," (map write args)) ")"))
+  (expr-category [_])
+  IHasType
+  (get-type [this] (:return-type (get-type func))))
+
+(defrecord AnonymousFunctionCallExpression [func-name args]
+  IExpression
+  (write [this]
+    (str func-name
+         "(" (str/join "," (map write args)) ")"))
+  (expr-category [_])
+  IHasType
+  (get-type [this]))
+
+(defrecord ComputedFunctionCallExpression [func-expr args]
+  IExpression
+  (write [this]
+    (str (write func-expr)
+         "(" (str/join "," (map write args)) ")"))
+  (expr-category [_])
+  IHasType
+  (get-type [this]))
+
+(defrecord VariableDeclaration [var-name var-type]
+  clojure.lang.Named
+  (getName [_] var-name)
+  IHasType
+  (get-type [_] var-type)
+  IExpression
+  (expr-category [_])
+  (write [_] (write-decl-expr var-type var-name)))
+
+(defrecord VariableRefExpression [variable]
+  IExpression
+  (write [_] (name variable))
+  (expr-category [_])
+  IHasType
+  (get-type [_] (get-type variable)))
+
+(defrecord AnonymousVariableRefExpression [var-name]
+  IExpression
+  (write [_] var-name)
+  (expr-category [_])
+  IHasType
+  (get-type [_]))
 
 (declare cexpand)
 
-(defn c-func-call [func args]
-  (str func "(" (str/join "," (for [x args] (cexpand x))) ")"))
+(defn cexpand-num [x]
+  (let [ntype (type x)]
+    (cond
+     (= ntype Int64)
+     (if (and (>= x Int32/MinValue) (<= x Int32/MaxValue))
+       (Int32Literal. x)
+       (Int64Literal. x))
+     (= ntype Double)
+     (DoubleLiteral. x))))
+
+(defn lookup-symbol [sym-name])
+
+(defn lookup-macro [macro-name])
+
+(def ^:private cintrinsics (atom {}))
 
 (defn cexpand-op-sym [sym args]
   (if-let [intrinsic (@cintrinsics sym)]
     (apply intrinsic args)
-    (if-let [macro (@cmacros sym)]
+    (if-let [macro (lookup-macro sym)]
       (cexpand (apply macro args))
-      (if (contains? *locals* sym)
-        (c-func-call (name sym) args)
-        (if-let [foreign (resolve-sym @*cmodule-context* sym)]
-          (c-func-call foreign args)
+      (if-let [local-func (get *locals* sym)]
+        (AnonymousFunctionCallExpression. (name sym) (map cexpand args))
+        (if-let [defined (lookup-symbol sym)]
+          (FunctionCallExpression. defined (map cexpand args))
           (throw (ArgumentException. (str "Don't know how to handle list symbol " sym))))))))
 
-(defn cexpand-list
-  ([form]
-      (cexpand-list (first form) (rest form)))
-  ([op args]
-     (when op
-       (cond
-        (symbol? op) (cexpand-op-sym op args)
-        (keyword? op) (c-func-call (name op) args)
-        (list? op)
-        (loop [expanded (cexpand-list op)]
-          (cond (string? expanded) (c-func-call expanded args)
-                (list? expanded) (recur (cexpand-list expanded))
-                :default (cexpand-list expanded args)))
-        :default (throw (ArgumentException. (str "Don't know how to handle list starting with" op)))))))
-
-(defn cexpand-sym [sym]
-  (if
-   (contains? *locals* sym) (name sym)
-   (if-let [foreign
-            (resolve-sym @*cmodule-context* sym)]
-     foreign
-     (throw (ArgumentException. (str "Unresolved symbol " sym))))))
+(defn cexpand-list [[op & args]]
+  (cond
+   (symbol? op) (cexpand-op-sym op args)
+   (keyword? op) (AnonymousFunctionCallExpression. (name op) (map cexpand args))
+   (list? op)
+   (loop [expanded (cexpand-list op)]
+     (cond
+      (satisfies? IExpression expanded) (ComputedFunctionCallExpression. expanded (map cexpand args))
+      (list? expanded) (recur (cexpand-list expanded))
+      :default (cexpand-list expanded args)))
+   :default (throw (ArgumentException. (str "Don't know how to handle list starting with" op)))))
 
 (defn cexpand [form]
   (cond
-   (number? form) (pr-str form)
-   (string? form) (pr-str form)
-   (seq? form) (cexpand-list form)
-   (keyword? form) (name form)
-   (symbol? form) (cexpand-sym form)
+   (satisfies? IExpression form) form
+   (nil? form) null-literal
+   (number? form) (cexpand-num form)
+   (= Boolean (type form)) (BooleanLiteral. form)
+   (string? form) (StringLiteral. form)
+   (symbol? form) (lookup-symbol form)
+   (keyword? form) (AnonymousVariableRefExpression. (name form))
+   (list? form) (cexpand-list form)
    :default (throw (ArgumentException. (str "Don't know how to handle " form " of type " (type form))))))
 
-(defn cintrinsic [sym func]
+(defn is-block? [expr]
+  (let [cat (expr-category expr)]
+    (or (= :statement* cat) (= :block cat))))
+
+(defn cintrinsic* [sym func]
   (swap! cintrinsics assoc sym func))
 
+(defmacro cintrinsic [sym args & body]
+  `(cintrinsic* '~sym
+               (fn ~sym ~args
+                 (let [~@(reduce (fn [res x] (into res [x `(cexpand ~x)])) [] args)]
+                   ~@body))))
+
+(defn- sanitize-class-name [name]
+  (reduce (fn [name [orig sub]] (str/replace name orig sub))
+          (partition 2
+                     ["+" "PLUS"
+                      "=" "EQ"
+                      ">" "GT"
+                      "<" "LT"
+                      "!" "BANG"
+                      ""])))
+
+(defn- get-expr-record-sym [sym]
+  (symbol (clojure.lang.Compiler/munge
+           (str (name sym) "Expression"))))
+
 (defmacro cop [sym args & body]
-  `(cintrinsic '~sym
-          (fn ~sym ~args
-            (let [~@(reduce (fn [res x] (into res [x `(cexpand ~x)])) [] args)]
-              ~@body))))
+  (let [rec-sym (get-expr-record-sym sym)]
+    `(do
+      (defrecord ~rec-sym ~args
+        IExpression
+        (expr-category [_])
+        ~@body)
+      (cintrinsic ~sym ~args
+                  (new ~rec-sym ~@args)))))
 
-(defmacro cbinop [sym] `(cop ~sym [x# y#] (str "(" x# " " ~(name sym) " " y# ")")))
+(defn get-bin-op-type [x y]
+  (let [xt (get-type x)
+        yt (get-type y)]
+    (when (= xt yt)
+      xt)))
 
-(defmacro cbinop* [sym expr] `(cop ~sym [x# y#] (str "(" x# " " ~expr " " y# ")")))
+(defmacro cbinop [sym]
+  `(cop ~sym [x# y#]
+        (write [_] (str "(" (write x#) " " ~(name sym) " " (write y#) ")"))
+        IHasType
+        (get-type [_] (get-bin-op-type x# y#))))
+
+(defmacro cbinop* [sym expr]
+  `(cop ~sym [x# y#]
+        (write [_] (str "(" (write x#) " " ~expr " " (write y#) ")"))
+        IHasType
+        (get-type [_] (get-bin-op-type x# y#))))
 
 (defmacro cbinops [& syms]
   `(do ~@(for [x syms] `(cbinop ~x))))
 
-(cbinops + - * / > >= < <= += -= *= /= %= <<= >>=)
-(cbinop* = "==")
-(cbinop* not= "!=")
+(defmacro compop [sym]
+  `(cop ~sym [x# y#]
+        (write [this#] (str "(" (write x#) " " ~(name sym) " " (write y#) ")"))
+        IHasType
+        (get-type [this#] 'bool)))
+
+(defmacro compops [& syms]
+  `(do ~@(for [x syms] `(compop ~x))))
+
+(defmacro compop* [sym expr]
+  `(cop ~sym [x# y#]
+        (write [this#] (str "(" (write x#) " " ~expr " " (write y#) ")"))
+        IHasType
+        (get-type [this#] 'bool)))
+
+(defmacro cassignop [sym expr]
+  (let [rec-sym (get-expr-record-sym sym)]
+    `(do
+       (defrecord ~rec-sym
+           [x# y#]
+         IHasType
+         (get-type [_])
+         IExpression
+         (expr-category [_])
+         (write [this#] (str "(" (write x#) " " ~expr " " (write y#) ")")))
+       (cintrinsic
+        ~sym
+        [target# source#]
+        (if (is-block? source#)
+          (wrap-last source#
+                     (fn [x#] (new ~rec-sym target# x#)))
+          (new ~rec-sym target# source#))))))
+
+(cbinops + - * /  += -= *= /= %= <<= >>=)
+(compops += -= *= /= %= <<= >>=)
+(compop* = "==")
+(compop* not= "!=")
 (cbinop* mod "%")
-
-(cbinop* or "||")
-(cbinop* and "&&")
+(compop* or "||")
+(compop* and "&&")
 (cbinop* bit-or "|")
-(cbinop* bit-or= "|=")
+(cassignop bit-or= "|=")
 (cbinop* bit-and "&")
-(cbinop* bit-and= "&=")
+(cassignop bit-and= "&=")
 (cbinop* bit-shift-left "<<")
-(cbinop* bit-shift-left="<<=")
+(cassignop bit-shift-left="<<=")
 (cbinop* bit-shift-right ">>")
-(cbinop* bit-shift-right= ">>=")
+(cassignop bit-shift-right= ">>=")
 (cbinop* bit-xor "^")
-(cbinop* bit-xor= "^=")
+(cassignop bit-xor= "^=")
 (cbinop* bit-not "~")
-(cbinop* bit-not= "~=")
-(cbinop* comma ",")
-(cbinop* set! "=")
+(cassignop bit-not= "~=")
+(cassignop set! "=")
 
-(cop inc [x] (str "++" x))
-(cop dec [x] (str "--" x))
-(cop post-inc [x] (str x "++"))
-(cop post-dec [x] (str x "--"))
-(cop not [x] (str "!" x))
+(defmacro cunop [name arg & body]
+  `(cop ~name ~arg
+        (write [this#] ~@body)
+        IHasType
+        (get-type [this#] (get-type ~(first arg)))))
 
-(cop ? [x y z] (str "(" x " ? " y " : " z ")"))
+(defn write-str [& args]
+  (apply str (for [arg args]
+               (if (string? arg)
+                 arg
+                 (write arg)))))
 
-(cop sizeof [x] (str "sizeof(" x ")"))
+(cunop inc [x] (write-str "++" x))
+(cunop dec [x] (write-str "--" x))
+(cunop post-inc [x] (write-str x "++"))
+(cunop post-dec [x] (write-str x "--"))
 
-(cintrinsic '. (fn [& args]
-                   (str/join "." (map cexpand args))))
-(cintrinsic '-> (fn [& args]
-                  (str/join "->" (map cexpand args))))
+(cop not [x]
+     (write [_] (write-str "!" write x))
+     IHasType
+     (get-type [_] 'bool))
 
-(cintrinsic 'aget (fn [x y]
-                    (str (cexpand x) "[" (cexpand y) "]")))
+(cop sizeof [x]
+     (write [_] (write-str "sizeof(" x ")"))
+     IHasType
+     (get-type [_] 'size_t))
 
-(cintrinsic 'aset (fn [target idx value]
-                    (str (cexpand target) "[" (cexpand idx) "] = "
-                         (cexpand value))))
+;; (defn c* [& args]
+;;   (let [expanded (for [arg args]
+;;                    (if (string? arg)
+;;                      arg
+;;                      (cexpand arg)))]
+;;     (apply str expanded)))
 
-(cintrinsic 'ref (fn [x] (str "(&" (cexpand x) ")")))
+;; (cintrinsic 'c* c*)
 
-(cintrinsic 'deref (fn [x] (str "*" (cexpand x))))
+(cintrinsic* '.
+     (fn [& args]
+       (let [args (map cexpand args)]
+         (reify
+           IHasType
+           (get-type [_])
+           IExpression
+           (expr-category [_])
+           (write [_]
+             (str/join "." (map write args)))))))
 
-(defn c* [& args]
-  (let [expanded (for [arg args]
-                   (if (string? arg)
-                     arg
-                     (cexpand arg)))]
-    (apply str expanded)))
+(cintrinsic* '->
+            (fn [& args]
+              (let [args (map cexpand args)]
+                (reify
+                  IHasType
+                  (get-type [_])
+                  IExpression
+                  (expr-category [_])
+                  (write [_]
+                    (str/join "->" (map write args)))))))
 
-(cintrinsic 'c* c*)
+(cop aget [x y]
+     (write [_] (write-str x "[" y "]"))
+     IHasType
+     (get-type [_]))
+
+(defrecord ArraySetExpression [target idx value]
+  IHasType
+  (get-type [_] (get-type target))
+  IExpression
+  (expr-category [_])
+  (write [_] (write-str target "[" idx "] = " value)))
+
+(cintrinsic aset [target idx value]
+            (if (is-block? value)
+              (wrap-last value (fn [x] (ArraySetExpression. target idx x)))
+              (ArraySetExpression. target idx value)))
+
+(cop ref [x]
+     (get-type [_])
+     (write [_] (write-str "(&" x ")")))
+
+(cop deref [x]
+     (get-type [_])
+     (write [_] (write-str "*" x)))
+
+(def ^:dynamic *indent* 0)
 
 (defn indent [] (str/join (for [x (range *indent*)] " ")))
 
@@ -198,200 +610,271 @@
             expr))
   expr)
 
-(defn cexpand-reduce [form] (reduce-parens (cexpand form)))
+(defrecord Statement [expr noindent]
+  IExpression
+  (get-type [_] (get-type expr))
+  (expr-category [_] :statement)
+  (wrap-last [_ func]
+    (Statement. (func expr) noindent))
+  (write [_]
+    (str (when-not noindent (indent)) (reduce-parens (write expr)) ";")))
 
 (defn cstatement [expr & {:keys [noindent]}]
-  (let [res (str (when-not noindent (indent)) (cexpand-reduce expr))
-        res (if (or
-                 (.EndsWith res "}")
-                 (.EndsWith res "})")
-                 (.EndsWith res ";")
-                 (.EndsWith res "*/"))
-              res
-              (str res ";"))]
-    res))
+  (let [expr (cexpand expr)]
+    (if (or (is-block? expr) (instance? Statement expr))
+      expr
+      (Statement. (cexpand expr) noindent))))
+
+(defn- wrap-statements [func statements]
+  (conj (vec (drop-last statements))
+        (let [last-st (last statements)]
+          (if (is-block? last-st)
+            (wrap-last last-st func)
+            (func last-st)))))
+
+(defrecord Statements [statements]
+  IExpression
+  (get-type [_] (get-type (last statements)))
+  (expr-category [_] :statement*)
+  (write [_] (str/join "\n" (map write statements)))
+  (wrap-last [_ func] (wrap-statements func statements)))
 
 (defn cstatements [statements]
-  (let [statements (for [st statements] (cstatement st))]
-    (str/join "\n" statements)))
+  (Statements. (for [st statements] (cstatement st))))
 
-(cintrinsic 'case
-            (fn [test & args]
-              (let [cases (partition-all 2 args)
-                    cases (binding [*indent* (inc *indent*)]
-                            (for [[expr block] cases]
-                              (if block
-                                (let [block (binding [*indent* (inc *indent*)]
-                                              (cstatement block))]
-                                  (str (indent) "case " (cexpand expr) ":\n" block "\n" (indent) "break;\n"))
-                                (str (indent) "default:" (cexpand expr) "\n" (indent) "break;\n"))))]
-                (str "switch(" (cexpand test) ") {\n" (str/join "\n" cases) (indent) "\n}"))))
+(defrecord CaseExpression [test cases]
+  IExpression
+  (get-type [_])
+  (expr-category [_] :statement*)
+  (write [_]
+    (let [cases
+          (binding [*indent* (inc *indent*)]
+            (for [[expr block] cases]
+              (if block
+                (let [block (binding [*indent* (inc *indent*)]
+                              (write block))]
+                  (str (indent) "case " (write expr) ":\n" block "\n" (indent) "break;\n"))
+                (str (indent) "default:" (write expr) "\n" (indent) "break;\n"))))]
+      (str "switch(" (write test) ") {\n" (str/join "\n" cases) (indent) "\n}")))
+  (wrap-last [_ func]
+    (CaseExpression.
+     test
+     (for [[expr block] cases]
+       (if block
+         [expr (wrap-last block func)]
+         [(wrap-last expr func)])))))
 
-(defn cblock [statements]
-  (str (indent) "{\n"
-       (binding [*indent* (inc *indent*)]
-         (cstatements statements))
-       "\n" (indent) "}"))
+(cintrinsic*
+ 'case
+ (fn [test & args]
+   (let [test (cexpand test)
+         cases (partition-all 2 args)
+         cases
+         (for [[expr block] cases]
+           (if block
+             [(cexpand expr)
+              (cstatement block)]
+             [(cstatement expr)]))]
+     (CaseExpression. test cases))))
 
-(defn child-block [statements]
-  (let [nsts (count statements)]
-                     (cond
-                      (= 0 nsts) "{ }"
-                      ;; (= 1 nsts) (binding [*indent* (inc *indent*)]
-                      ;;              (cstatement (first statements)))
-                      :default (cblock statements))))
+(defrecord ReturnExpression [expr]
+  IExpression
+  (get-type [_] (get-type expr))
+  (expr-category [_])
+  (write [_] (if expr
+               (str "return " (reduce-parens (write expr)))
+               "return")))
 
-(cintrinsic 'if
-            (fn ([expr then]
-                  (str "if(" (cexpand-reduce expr) ")\n"
-                       (cexpand then)))
+(cintrinsic*
+ 'return
+ (fn
+   ([] (ReturnExpression. nil))
+   ([expr]
+      (let [expr (cexpand expr)]
+        (if (is-block? expr)
+          (wrap-last expr (fn [x] (ReturnExpression. x)))
+          (ReturnExpression. expr))))))
+
+;; (defn cblock [statements]
+;;   (str (indent) "{\n"
+;;        (binding [*indent* (inc *indent*)]
+;;          (cstatements statements))
+;;        "\n" (indent) "}"))
+
+;; (defn child-block [statements]
+;;   (let [nsts (count statements)]
+;;                      (cond
+;;                       (= 0 nsts) "{ }"
+;;                       ;; (= 1 nsts) (binding [*indent* (inc *indent*)]
+;;                       ;;              (cstatement (first statements)))
+;;                       :default (cblock statements))))
+
+(defrecord IfExpression [expr then else]
+  IExpression
+  (expr-category [_] :statement*)
+  (get-type [_])
+  (write [_]
+    (println expr then else)
+    (str "if(" (reduce-parens (write expr)) ")\n"
+         (write then)
+         (when else "\n" "else " (write else))))
+  (wrap-last [_ func]
+    (IfExpression.
+     expr
+     (wrap-last then func)
+     (when else (wrap-last else func)))))
+
+(cintrinsic* 'if
+             (fn
+               ([expr then]
+                  (IfExpression. (cexpand expr)
+                                 (cstatement then)
+                                 nil))
               ([expr then else]
-                 (str "if(" (cexpand-reduce expr) ")\n"
-                      (cexpand then) "\n"
-                      "else " (cexpand else)))))
+                 (IfExpression. (cexpand expr)
+                                (cstatement then)
+                                (cstatement else)))))
 
-(cintrinsic 'for
-            (fn [init test each & statements]
-              (str "for("
-                   (cexpand-reduce init) "; "
-                   (cexpand-reduce test) "; "
-                   (cexpand-reduce each) ")\n"
-                   (child-block statements))))
+(defrecord DeclExpression [var-type var-name init-expr]
+  IExpression
+  (get-type [_] var-type)
+  (write [_] (str (write-decl-expr var-type var-name) "=" (when init-expr (write init-expr))))
+  (expr-category [_]))
 
-(cintrinsic 'while
-            (fn [test & statements]
-              (str "while("
-                   (cexpand-reduce test) ")\n"
-                   (child-block statements))))
+(defrecord BlockExpression [statements]
+  IExpression
+  (get-type [_] (get-type (last statements)))
+  (expr-category [_] :block)
+  (wrap-last [_ func]
+    (BlockExpression.
+     (wrap-statements func statements)))
+  (write [_]
+    (str (indent) "{\n"
+       (binding [*indent* (inc *indent*)]
+         (str/join "\n" (map write statements)))
+       "\n" (indent) "}")))
 
-(cintrinsic 'return
-            (fn ([] "return")
-              ([x] (str "return " (cexpand-reduce x)))))
+(defn cblock [& statements]
+  (BlockExpression. (map cstatement statements)))
 
-(cintrinsic 'break (fn [] "break"))
-(cintrinsic 'continue (fn [] "continue"))
-(cintrinsic 'label (fn [x] (str (name x) ":")))
-(cintrinsic 'goto (fn [x] (str "goto " (name x))))
+(cintrinsic* 'do cblock)
 
-(cintrinsic 'comment (fn [x] (str "/*" x "*/")))
+(defn- add-local [decl]
+  (let [var-name (name decl)]
+    (assert *locals* "No local variable context for let expression")
+    (assert (not (get *locals* var-name))
+            (str "Local variable named " var-name " already defined"))
+    (set! *locals* (assoc *locals* var-name decl))))
 
-(cintrinsic 'do (fn [& statements] (cblock statements)))
-
-(def ^:private ctypes (atom {}))
-
-(defmacro add-ctypes [& type-map]
-  (let [type-map (flatten (for [[id ctype clr-type] (partition 3 type-map)]
-                            [ (name id) {:ctype (name ctype) :clr-type clr-type} ]))]
-    (swap! ctypes #(apply assoc % type-map))))
-
-(add-ctypes
- u8 uint8_t Byte
- u16 uint16_t UInt16
- u32 uint32_t UInt32
- u64 uint64_t UInt64
- i8 int8_t SByte
- i16 int16_t Int16
- i32 int32_t Int32
- i64 int64_t Int64
- float float Single
- double double Double
- void void nil)
-
-(declare get-ctype)
-
-(defn fn-ptr-sig [fn-ptr-vec name]
-  (let [ret (first fn-ptr-vec)
-        params (rest fn-ptr-vec)]
-    (str (get-ctype ret) "(__stdcall *" name ")(" (str/join "," (map get-ctype params)) ")")))
-
-(def ^:dynamic *local-def-types* {})
-
-(defn get-def-type [type-name]
-  (if-let [type-name* (*local-def-types* type-name)]
-    type-name*
-    (when-let [typedef (@defined-types type-name)]
-      (doseq [type-ref (:type-refs typedef)]
-        (get-def-type type-ref))
-      (set! *header* (str *header* "\n" (:text typedef) "\n"))
-      (set! *local-def-types* (assoc *local-def-types* type-name type-name))
-      type-name)))
-
-(defn get-ctype [type-name]
-  (cond
-   (vector? type-name) (fn-ptr-sig type-name nil)
-   :default
-   (let [type-name (name type-name)
-         ptr-idx (.IndexOf type-name "*")
-         ptr-part (when (> ptr-idx 0) (.Substring type-name ptr-idx))
-         type-name (if ptr-part (.Substring type-name 0 ptr-idx) type-name)
-         ctype (or (get-in @ctypes [type-name :ctype])
-                    (get-def-type type-name)
-                    type-name)]
-      (str ctype ptr-part))))
-
-(defn get-clr-type [type-name]
-  (if (vector? type-name)
-    IntPtr
-    (let [type-name (name type-name)
-          ptr-idx (.IndexOf type-name "*")
-          ptr-part (when (> ptr-idx 0) (.Substring type-name ptr-idx))
-          type-name (if ptr-part (.Substring type-name 0 ptr-idx) type-name)
-          info (@ctypes type-name)
-          def-info (get-def-type type-name)]
-      (if info
-        (if ptr-part
-          IntPtr
-          (eval (:clr-type info)))
-        (when ptr-part
-          IntPtr)))))
-
-(defn c-type-name-pair [t n]
-  (if (vector? t)
-    (fn-ptr-sig t n)
-    (str (get-ctype t) " " n)))
-
-(defn cdecl
-  ([type name init]
-     (set! *locals* (conj *locals* name))
-     (let [tn (c-type-name-pair type name)]
-       (str tn " = " (cexpand init))))
-  ([type name]
-     (set! *locals* (conj *locals* name))
-     (c-type-name-pair type name)))
-
-(cintrinsic 'decl cdecl)
-
-(cintrinsic 'new
-            (fn [target & args]
-              (str "new " (get-ctype target) "("
-                  (str/join "," (map cexpand args)) ")")))
-
-(cintrinsic 'delete
-            (fn [target]
-              (c* "delete " target)))
+(cintrinsic*
+ 'let
+ (fn [& [forms]]
+   (assert (even? (count forms)) "let expression must contain an even number of forms")
+   (apply
+    cblock
+    (for [[decl expr-form] (partition 2 forms)]
+      (let [init-expr (cexpand expr-form)
+            explicit-tag (:tag (meta decl))
+            decl-type (if explicit-tag
+                        explicit-tag
+                        (get-type init-expr))]
+        (assert decl-type (str "unable to infer type for let binding: " decl " " expr-form))
+        (let [decl-type (lookup-type decl-type)
+              decl-expr (VariableDeclaration.
+                         (name decl)
+                         decl-type)]
+          (add-local decl-expr)
+          (if (is-block? init-expr)
+            (wrap-last init-expr (fn [x] (set_BANG_Expression. (VariableRefExpression. decl-expr) x)))
+            (set_BANG_Expression. (VariableRefExpression. decl-expr) init-expr))))))))
 
 
-(defn ccast [ty nm]
-  (str "((" (get-ctype ty) ")" (cexpand nm) ")"))
+;; (defn create-cfn-body [name args body]
+;;   (binding [*locals* (extract-locals args)]
+;;     (let [sig-txt (cfnsig name ret args)
+;;           body-txt (cblock body)
+;;           fn-txt (str sig-txt "\n" body-txt "\n")]
+;;       fn-txt)))
 
-(cintrinsic 'cast ccast)
+;; (defmacro cdefn [name ret args & body]
+;;   (compile-cfn name ret args body))
 
-(defn cfnsig [name ret args]
-  (str (get-ctype ret) " "
-       name "("
-       (str/join ", "
-                 (for [[t n] (partition-all 2 args)]
-                   (cond
-                    (and (nil? n) (= "..." (name t)))
-                    "..."
-                    (vector? t)
-                    (fn-ptr-sig t n)
-                    :default
-                    (str (get-ctype t) " " n))))
-       ")"))
+(defrecord StructField [name type-name bits]
+  clojure.lang.Named
+  (getName [_] name)
+  IField
+  (get-field-type [_] (lookup-type type-name))
+  (get-bitfield-width [_] bits))
 
-(defn extract-locals [args]
-  (apply hash-set (for [[_ n] (partition 2 args)] n)))
+(defrecord Struct [package struct-name fields]
+  IDeclaration
+  (write-decl [_]
+    (str "typedef struct " struct-name " {\n"
+       (str/join
+        (for [field fields]
+          (str " "
+               (write-decl-expr (get-field-type field)
+                                (name field))
+               (when-let [bits (get-bitfield-width field)]
+                 (str ":" bits)) ";\n")))
+       "} " struct-name ";"))
+  (write-impl [_])
+  (decl-package [_] package))
+
+(defn- compile-cstruct [struct-name members]
+  (let [struct
+        (Struct. (name struct-name)
+                 (for [[type-name field-name bits] members]
+                   (StructField. (name field-name) type-name bits)))]
+    (comment TODO add struct to module/package)
+    (print-struct struct)))
+
+(defmacro cstruct [name & members]
+  (compile-cstruct name members))
+
+(defn parse-cfn [package [func-name & forms]]
+  (let [f1 (first forms)
+        doc-str (when (string? f1) f1)
+        params (if doc-str (second forms) f1)
+        body-forms (if doc-str (nnext forms) (next forms))
+        params (for [param params]
+                      (let [metadata (meta param)
+                            param-name (name param)
+                            param-type (:tag metadata)]
+                        (FunctionParameter. param-name param-type metadata)))]
+    (binding [*locals* (into {} (for [param params] [(name param) param]))
+              *locals-decls* {}
+              *referenced-decls* #{}]
+      (let [body-statements (map cstatement body-forms)
+            body-block (if (and (= 1 (count body-statements))
+                                (= :block (expr-category (first body-statements))))
+                         (first body-statements)
+                         (BlockExpression. body-statements))
+            func-metadata (meta func-name)
+            func-name (name func-name)
+            ret-type (:tag func-metadata)
+            func-type (FunctionType. ret-type params)
+            func-decl (FunctionDeclaration. package func-name func-type body-block *referenced-decls* func-metadata)]
+        (package-add-symbol package func-decl)
+        func-decl))))
+
+(defn- output-dev-src [package decls cpp-mode preamble temp-output-path]
+  (binding [*dynamic-compile* true]
+    (let [anon-header (str/join "\n\n" (doall
+                                        (for [decl (:declarations package)]
+                                          (when-not (name decl)
+                                            (write-decl decl)))))
+          referenced (apply set/union (map :referenced-decls decls))
+          header (str/join "\n\n" (doall (map write-impl referenced)))
+          body (str/join "\n\n" (doall (map write-impl decls)))
+          src (apply str/join "\n\n" preamble anon-header header body)
+          filename (str/join "_" (map name decls))
+          ;; TODO save id??
+          filename (str filename (if cpp-mode ".cpp" ".c"))
+          filename (Path/Combine temp-output-path filename)]
+      (println src)
+      (File/WriteAllText filename src)
+      (CompileSource. src body filename))))
 
 (defn print-numbered [txt]
   (let [lines (str/split-lines txt)]
@@ -399,139 +882,35 @@
      (map-indexed
       (fn [i line] (println (str i "  " line))) lines))))
 
-(defn- cstruct-member [member]
-  (let [ty (first member)
-        name (second member)
-        bits (first (nnext member))]
-    (str " " (c-type-name-pair ty name) (when bits (str ":" bits)) ";\n")))
-
-(defn add-def-type [name info]
-  (swap! defined-types assoc name info)
-  (swap! (@cmodules-by-ns *ns*) assoc-in [:deftypes name] info))
-
-(defn- compile-cstruct [name members]
-  (let [name (str name)]
-    (binding [*header* ""
-              *local-def-types* {name (str "struct " name)}]
-      (let [body-txt
-            (str/join (map #(cstruct-member %) members))
-            struct-txt
-            (str "typedef struct " name " {\n"
-                 body-txt
-                 "} " name ";")
-            mod (@cmodules-by-ns *ns*)
-            info {:text struct-txt
-                  :type-refs (remove #(= name %) (keys *local-def-types*))}]
-        (add-def-type name info)
-        (println struct-txt)))))
-  
-(defmacro cstruct [name & members]
-  (compile-cstruct name members))
-
-(defn init-header []
-  (set! *header* (str *header* "#include <stdint.h>\n"))
-  (when-let [mod (@cmodules-by-ns *ns*)]
-    (let [headers
-          (str/join
-           "\n" (:headers @mod))]
-      (set! *header* (str *header* headers "\n")))))
-
-(defn wrap-compile-cfn [func]
-  (binding [*header* ""
-            *local-def-types* {}]
-    (init-header)
-    (func)))
-
-(defn create-cfn-body [name ret args body]
-  (binding [*locals* (extract-locals args)]
-    (let [sig-txt (cfnsig name ret args)
-          body-txt (cblock body)
-          fn-txt (str sig-txt "\n" body-txt "\n")]
-      fn-txt)))
-
-(defn compile-cfn [name ret args body]
-  (wrap-compile-cfn
-   (fn []
-     (let [fn-txt (create-cfn-body name ret args body)
-           compiled (compilefn @*cmodule-context* name ret args fn-txt)]
-       (intern *ns* name compiled)))))
-
 (defn compile-cfns [funcs]
-  (wrap-compile-cfn
-   (fn []
-     (let [funcs (for [[name ret args & body] funcs]
-                   {:name name :ret ret :args args :body (create-cfn-body name ret args body)})
-           compiled (compilefns @*cmodule-context* funcs)]
-       (doseq [[name func] compiled]
-         (intern *ns* name func))))))
+  (let [{:keys [module] :as package} (get-package)]
+    (if (dev-mode? module)
+      (let [{:keys [compile-ctxt temp-output-path preamble cpp-mode]} module
+            func-decls (doall (for [func funcs] (parse-cfn package func)))
+            {:keys [body-source] :as src}
+            (output-dev-src package func-decls cpp-mode preamble temp-output-path)]
+        (when-let [compiled compile-decls]
+          (println body-source)
+          (doseq [[n v] compiled] (intern *ns* (name n) v))))
+      (let [{:keys [loader]} module]
+        (doseq [[func-name & forms] funcs]
+          (load-symbol (:name package) func-name))))))
 
-(defmacro cdefn [name ret args & body]
-  (compile-cfn name ret args body))
+(defmacro cdefn [& forms]
+  (compile-cfns [forms]))
 
-(defmacro cdefns [& funcs]
-  (compile-cfns funcs))
+(defmacro cdefn- [& forms]
+  `(c-in-clj.core/cdefn ^:private ~@forms))
 
-(comment (def c-unquote)
-         (def c-unquote-splicing)
+(defmacro cdefns [])
 
-         (defn expand-cmacro-form [form]
-           (let [op (first form)
-                 more (rest form)]
-             (cond 
-              (= op 'clojure.core/unquote) [(cexpand more)]
-              (= op 'clojure.core/unquote-splicing) (map cexpand more)
-              (seq? form) (reduce into (map expand-cmacro-form form))
-              :default form)))
 
-         (defmacro c' [& forms]
-           `(expand-cmacro ~forms)))
+;;; Test code
+(csource-module TestModule :dev true)
 
-(defn unqualify-symbols [form]
-  (if (seq? form)
-    (for [f form]
-      (unqualify-symbols f))
-    (if (symbol? form)
-      (symbol (name form))
-      form)))
+(cpackage TestModule "test1")
 
-(defmacro cmacro [name params & body]
-  `(do
-     (swap! c-in-clj.core/cmacros assoc '~name (fn ~params
-                                                 (unqualify-symbols
-                                                        (do ~@body))))))
+(cdefn ^void t1 [^i32 x])
 
-(defn cheader [value]
-  (when-let [mod (@cmodules-by-ns *ns*)]
-    (swap! mod update-in [:headers] conj value)))
 
-(defn cdefine [key value]
-  (cheader (str "#define " (name key) " " value)))
 
-(defmacro ctypedef [name value]
-  (add-def-type (str name) value))
-
-;(cinclude "stdio.h")
-(comment
-  (cdefn add double [double x double y]
-         (return (+ x y)))
-
-  (cdefn test2 double [double x]
-         (return (add (* 7 x) (/ 47.435 x))))
-
-  (cdefn test3 double [double x]
-         (return (test2 x)))
-
-  (cdefn test4 double [double x [double double double] func]
-         (return (func x x))))
-
-;(ptest1 23895623589)
-;LoadLibrary -> dll handle
-;GetProcAddress -> func ptr
-;Alloc ptr to ptr, Set ptr = func ptr
-;resolve test1 -> ptr to func ptr
-
-; try, catch, finally, raii for c: http://code.google.com/p/libex/
-; good c hash map, tree, etc. lib: https://github.com/attractivechaos/klib
-
-(comment (cdefn test2 i32 [i32 x i32 y]
-                (return (+ (test1 x) (test1 y)))))
