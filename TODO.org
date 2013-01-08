@@ -1,0 +1,7 @@
+* IDeclaration
+* create define-type fn
+* void$i32+i64 function pointer syntax, int! int!4 array syntax
+* array literals
+* anonymous functions (fn...)
+
+
