@@ -50,10 +50,15 @@
  [{:keys [cpp-mode]} expr]
  (str (when cpp-mode "extern \"C\" ") "__declspec(dllexport) "))
 
+(msvc-hook
+ :alternate-function-declaration
+ [ctxt decl]
+ (when *dynamic-compile*))
+
 (defn- msvc-write-hook [ctxt hook-name expr]
   (dispatch-hook #'msvc-hook hook-name ctxt expr))
 
-(defrecord MSVCCompileContext []
+(defrecord MSVCCompileContext [compiled-symbols]
   ICompileContext
   (write-hook [this hook-name expr]
     (msvc-write-hook this hook-name expr))
@@ -82,7 +87,7 @@
         (merge {:cl-bat-path
                 (init-cl-bat temp-output-path msvc-path)}
                opts)]
-    (MSVCCompileContext. nil opts)))
+    (MSVCCompileContext. (atom {}) nil opts)))
 
 (defn dll-load-symbol [{:keys [opts]} package-name symbol-name])
 
