@@ -42,7 +42,7 @@
 (def null-compile-context
   (reify ICompileContext
     (write-hook [hook-name expr])
-    (compile-decls [decls source-file-path] {})
+    (compile-decls [decls {:keys [source]}] (println source))
     (resolve-ext-sym [sym-name])
     (resolve-ext-type [type-name])))
 
@@ -83,12 +83,11 @@
 (defn create-module [module-name init-compile-ctxt-fn init-load-ctxt-fn {:keys [dev] :as opts}]
   (if (if (not (nil? dev)) dev (dev-env?))
     (let [{:keys [src-output-path temp-output-path cpp-mode preamble]} opts
+          temp-output-path (or temp-output-path (Path/Combine (Path/GetTempPath) "c-in-clj"))
           cpp-mode (or cpp-mode false)
           preamble (or preamble (if cpp-mode
                                   default-cpp-preamble
-                                  default-c-preamble))
-          ;;TODO default output paths
-          ]
+                                  default-c-preamble))]
       (Module. module-name (init-compile-ctxt-fn)
                src-output-path temp-output-path
                preamble cpp-mode
@@ -717,7 +716,6 @@
   IExpression
   (expr-category [_] :statement*)
   (write [_]
-    (println expr then else)
     (str "if(" (reduce-parens (write expr)) ")\n"
          (write then)
          (when else "\n" "else " (write else))))
@@ -851,19 +849,25 @@
         params (for [param params]
                       (let [metadata (meta param)
                             param-name (name param)
-                            param-type (:tag metadata)]
+                            param-type (lookup-type (:tag metadata))]
                         (FunctionParameter. param-name param-type metadata)))]
     (binding [*locals* (into {} (for [param params] [(name param) param]))
               *local-decls* {}
               *referenced-decls* #{}]
-      (let [body-statements (map cstatement body-forms)
+      (let [body-statements (if body-forms (map cstatement body-forms) [(ReturnExpression. nil)])
             body-block (if (and (= 1 (count body-statements))
                                 (= :block (expr-category (first body-statements))))
                          (first body-statements)
                          (BlockExpression. body-statements))
+            body-block (wrap-last
+                        body-block
+                        (fn [expr]
+                          (if (instance? ReturnExpression expr)
+                            expr
+                            (ReturnExpression. expr))))
             func-metadata (meta func-name)
             func-name (name func-name)
-            ret-type (:tag func-metadata)
+            ret-type (lookup-type (:tag func-metadata))
             func-type (FunctionType. ret-type params)
             func-decl (FunctionDeclaration. package func-name func-type body-block *referenced-decls* func-metadata)]
         (package-add-symbol package func-decl)
@@ -872,7 +876,7 @@
 (defn- output-dev-src [package decls cpp-mode preamble temp-output-path]
   (binding [*dynamic-compile* true]
     (let [anon-header (str/join "\n\n" (doall
-                                        (for [decl (:declarations package)]
+                                        (for [decl @(:declarations package)]
                                           (when-not (name decl)
                                             (write-decl decl)))))
           referenced (apply set/union (map :referenced-decls decls))
@@ -914,7 +918,6 @@
   `(c-in-clj.core/cdefn ^:private ~@forms))
 
 (defmacro cdefns [])
-
 
 ;;; Test code
 (csource-module TestModule :dev true)
