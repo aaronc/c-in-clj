@@ -13,7 +13,6 @@
   (wrap-last [this func]))
 
 (defprotocol IField
-  (get-field-type [this])
   (get-bitfield-width [this]))
 
 (defprotocol IType
@@ -156,30 +155,6 @@
 
 (def ^:dynamic *dynamic-compile* false)
 
-(declare lookup-type)
-
-(defmacro defliteral [name ctype]
-  (let [ctype (lookup-type ctype)]
-    `(defrecord ~name [value#]
-       IExpression
-       (write [_] (pr-str value#))
-       (expr-category [_] :literal)
-       IHasType
-       (get-type [_] ~ctype))))
-
-(defliteral Int32Literal int32_t)
-(defliteral Int64Literal int64_t)
-(defliteral DoubleLiteral double)
-(defliteral BooleanLiteral bool)
-(defliteral StringLiteral char*)
-
-(def null-literal
-  (reify IExpression
-    (write [this] "NULL")
-    (expr-category [_] :literal)
-    IHasType
-    (get-type [this])))
-
 (def ^:private primitive-types (atom {}))
 
 (def ^:private type-aliases (atom {}))
@@ -238,7 +213,6 @@
   (write-decl-expr [_ var-name] (str (write-type type) "* " var-name))
   (is-reference-type? [_] true)
   (get-fields [_]))
-
 (defrecord AnonymousType [type-name]
   clojure.lang.Named
   (getName [_] type-name)
@@ -260,6 +234,28 @@
           (if (.EndsWith type-name "*")
             (PointerType. (lookup-type (.Substring type-name 0 (dec (.Length type-name)))))
             (comment TODO)))))))
+
+(defmacro defliteral [name ctype]
+  (let [ctype (lookup-type ctype)]
+    `(defrecord ~name [value#]
+       IExpression
+       (write [_] (pr-str value#))
+       (expr-category [_] :literal)
+       IHasType
+       (get-type [_] ~ctype))))
+
+(defliteral Int32Literal int32_t)
+(defliteral Int64Literal int64_t)
+(defliteral DoubleLiteral double)
+(defliteral BooleanLiteral bool)
+(defliteral StringLiteral char*)
+
+(def null-literal
+  (reify IExpression
+    (write [this] "NULL")
+    (expr-category [_] :literal)
+    IHasType
+    (get-type [this])))
 
 (defrecord FunctionParameter [param-name param-type metadata]
   clojure.lang.Named
@@ -592,12 +588,14 @@
               (ArraySetExpression. target idx value)))
 
 (cop ref [x]
-     (get-type [_])
-     (write [_] (write-str "(&" x ")")))
+     (write [_] (write-str "(&" x ")"))
+     IHasType
+     (get-type [_]))
 
 (cop deref [x]
-     (get-type [_])
-     (write [_] (write-str "*" x)))
+     (write [_] (write-str "*" x))
+     IHasType
+     (get-type [_]))
 
 (def ^:dynamic *indent* 0)
 
@@ -612,16 +610,17 @@
 
 (defrecord Statement [expr noindent]
   IExpression
-  (get-type [_] (get-type expr))
   (expr-category [_] :statement)
   (wrap-last [_ func]
     (Statement. (func expr) noindent))
   (write [_]
-    (str (when-not noindent (indent)) (reduce-parens (write expr)) ";")))
+    (str (when-not noindent (indent)) (reduce-parens (write expr)) ";"))
+  IHasType
+  (get-type [_] (get-type expr)))
 
 (defn cstatement [expr & {:keys [noindent]}]
   (let [expr (cexpand expr)]
-    (if (or (is-block? expr) (instance? Statement expr))
+    (if (or (is-block? expr) (= :statement (expr-category expr)))
       expr
       (Statement. (cexpand expr) noindent))))
 
@@ -634,17 +633,19 @@
 
 (defrecord Statements [statements]
   IExpression
-  (get-type [_] (get-type (last statements)))
   (expr-category [_] :statement*)
   (write [_] (str/join "\n" (map write statements)))
-  (wrap-last [_ func] (wrap-statements func statements)))
+  (wrap-last [_ func] (wrap-statements func statements))
+  IHasType
+  (get-type [_] (get-type (last statements))))
 
 (defn cstatements [statements]
   (Statements. (for [st statements] (cstatement st))))
 
 (defrecord CaseExpression [test cases]
-  IExpression
+  IHasType
   (get-type [_])
+  IExpression
   (expr-category [_] :statement*)
   (write [_]
     (let [cases
@@ -678,8 +679,9 @@
      (CaseExpression. test cases))))
 
 (defrecord ReturnExpression [expr]
-  IExpression
+  IHasType
   (get-type [_] (get-type expr))
+  IExpression
   (expr-category [_])
   (write [_] (if expr
                (str "return " (reduce-parens (write expr)))
@@ -710,9 +712,10 @@
 ;;                       :default (cblock statements))))
 
 (defrecord IfExpression [expr then else]
+  IHasType
+  (get-type [_])
   IExpression
   (expr-category [_] :statement*)
-  (get-type [_])
   (write [_]
     (println expr then else)
     (str "if(" (reduce-parens (write expr)) ")\n"
@@ -736,14 +739,16 @@
                                 (cstatement else)))))
 
 (defrecord DeclExpression [var-type var-name init-expr]
-  IExpression
+  IHasType
   (get-type [_] var-type)
+  IExpression
   (write [_] (str (write-decl-expr var-type var-name) "=" (when init-expr (write init-expr))))
   (expr-category [_]))
 
 (defrecord BlockExpression [statements]
-  IExpression
+  IHasType
   (get-type [_] (get-type (last statements)))
+  IExpression
   (expr-category [_] :block)
   (wrap-last [_ func]
     (BlockExpression.
@@ -802,18 +807,22 @@
 (defrecord StructField [name type-name bits]
   clojure.lang.Named
   (getName [_] name)
+  IHasType
+  (get-type [_] (lookup-type type-name))
   IField
-  (get-field-type [_] (lookup-type type-name))
   (get-bitfield-width [_] bits))
 
 (defrecord Struct [package struct-name fields]
+  IHasType
+  (get-type [this] this)
+  IType
   IDeclaration
   (write-decl [_]
     (str "typedef struct " struct-name " {\n"
        (str/join
         (for [field fields]
           (str " "
-               (write-decl-expr (get-field-type field)
+               (write-decl-expr (get-type field)
                                 (name field))
                (when-let [bits (get-bitfield-width field)]
                  (str ":" bits)) ";\n")))
@@ -823,11 +832,13 @@
 
 (defn- compile-cstruct [struct-name members]
   (let [struct
-        (Struct. (name struct-name)
-                 (for [[type-name field-name bits] members]
-                   (StructField. (name field-name) type-name bits)))]
+        (Struct.
+         (get-package)
+         (name struct-name)
+         (for [[type-name field-name bits] members]
+           (StructField. (name field-name) type-name bits)))]
     (comment TODO add struct to module/package)
-    (print-struct struct)))
+    (write-decl struct)))
 
 (defmacro cstruct [name & members]
   (compile-cstruct name members))
@@ -843,7 +854,7 @@
                             param-type (:tag metadata)]
                         (FunctionParameter. param-name param-type metadata)))]
     (binding [*locals* (into {} (for [param params] [(name param) param]))
-              *locals-decls* {}
+              *local-decls* {}
               *referenced-decls* #{}]
       (let [body-statements (map cstatement body-forms)
             body-block (if (and (= 1 (count body-statements))
@@ -865,7 +876,7 @@
                                           (when-not (name decl)
                                             (write-decl decl)))))
           referenced (apply set/union (map :referenced-decls decls))
-          header (str/join "\n\n" (doall (map write-impl referenced)))
+          header (str/join "\n\n" (doall (map write-decl referenced)))
           body (str/join "\n\n" (doall (map write-impl decls)))
           src (apply str/join "\n\n" preamble anon-header header body)
           filename (str/join "_" (map name decls))
