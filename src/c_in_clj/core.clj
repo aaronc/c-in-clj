@@ -1,4 +1,4 @@
-;; (Environment/SetEnvironmentVariable "CLOJURE_LOAD_PATH" (str (Environment/ExpandEnvironmentVariables "%USERPROFILE%/dev/c-in-clj/src") (Environment/GetEnvironmentVariable "CLOJURE_LOAD_PATH")))kj
+;; (Environment/SetEnvironmentVariable "CLOJURE_LOAD_PATH" (str (Environment/ExpandEnvironmentVariables "%USERPROFILE%/dev/c-in-clj/src") (Environment/GetEnvironmentVariable "CLOJURE_LOAD_PATH")))
 (ns c-in-clj.core
   (:require [clojure.string :as str]
             [clojure.set :as set])
@@ -20,6 +20,7 @@
   (write-type [this])
   (write-decl-expr [this var-name])
   (is-reference-type? [this])
+  (is-function-type? [this])
   (create-new-expr [this args])
   (common-denominator-type [this other-type])
   (create-implicit-cast-expr [this expr])
@@ -207,7 +208,7 @@
 Usage: (dispatch-hook #'hook-map)."
   [hooks hook-name ctxt expr]
   (when-let [hook-impl (get @(:hook-map (meta hooks)) hook-name)]
-    (hook-impl ctxt) expr))
+    (hook-impl ctxt expr)))
 
 (defn dev-mode? [module] (instance? Module module))
 
@@ -223,6 +224,8 @@ Usage: (dispatch-hook #'hook-map)."
 
 (def ^:private type-aliases (atom {}))
 
+(def ^:private save-id (atom 0))
+
 (defrecord PrimitiveType [type-name]
   clojure.lang.Named
   (getName [_] type-name)
@@ -230,6 +233,7 @@ Usage: (dispatch-hook #'hook-map)."
   (write-type [_] type-name)
   (write-decl-expr [_ var-name] (str type-name " " var-name))
   (is-reference-type? [_] false)
+  (is-function-type? [_] false)
   (common-denominator-type [_ _]))
 
 (defmacro defprimitive [type-name]
@@ -275,15 +279,19 @@ Usage: (dispatch-hook #'hook-map)."
   IType
   (write-type [_] (str (write-type type) "*"))
   (write-decl-expr [_ var-name] (str (write-type type) "* " var-name))
+  (is-function-type? [_]
+    (is-function-type? type))
   (is-reference-type? [_] true)
   (get-fields [_]))
+
 (defrecord AnonymousType [type-name]
   clojure.lang.Named
   (getName [_] type-name)
   IType
   (write-type [_] type-name)
   (write-decl-expr [_ var-name] (str type-name " " var-name))
-  (is-reference-type? [_] false))
+  (is-reference-type? [_])
+  (is-function-type? [_]))
 
 (defn lookup-type [type-name]
   (cond
@@ -342,7 +350,8 @@ Usage: (dispatch-hook #'hook-map)."
     (write-function-type this 0 nil))
   (write-decl-expr [this var-name]
     (write-function-type this 0 var-name))
-  (is-reference-type? [this] false))
+  (is-reference-type? [this] false)
+  (is-function-type? [_] true))
 
 (defn write-function-signature [{:keys [function-name function-type] :as decl} ]
   (let [{:keys [return-type params]} function-type]
@@ -890,6 +899,8 @@ Usage: (dispatch-hook #'hook-map)."
   IHasType
   (get-type [this] this)
   IType
+  (is-function-type? [_] false)
+  (is-reference-type? [_] false)
   IDeclaration
   (write-decl [_]
     (str "typedef struct " struct-name " {\n"
@@ -961,9 +972,9 @@ Usage: (dispatch-hook #'hook-map)."
           header (str/join "\n\n" (doall (map write-decl referenced)))
           body (str/join "\n\n" (doall (map write-impl decls)))
           src (str/join "\n" [preamble anon-header header body])
-          filename (str/join "_" (map name decls))
+          filename (str/join  "_" (map name decls))
           ;; TODO save id??
-          filename (str filename (if cpp-mode ".cpp" ".c"))
+          filename (str (name package) "_" filename "_" (swap! save-id inc) (if cpp-mode ".cpp" ".c"))
           filename (Path/Combine temp-output-path filename)]
       (File/WriteAllText filename src)
       (CompileSource. src body filename))))
@@ -983,7 +994,7 @@ Usage: (dispatch-hook #'hook-map)."
             (output-dev-src package func-decls cpp-mode preamble temp-output-path)]
         (when-let [compiled (compile-decls compile-ctxt func-decls src)]
           (println body-source)
-          (doseq [[n v] compiled] (intern *ns* (name n) v))))
+          (doseq [[n v] compiled] (intern *ns* (symbol (name n)) v))))
       (let [{:keys [loader]} module]
         (doseq [[func-name & forms] funcs]
           (load-symbol loader (:name package) func-name))))))
