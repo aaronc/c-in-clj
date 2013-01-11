@@ -41,30 +41,37 @@
 (defrecord CompiledSymbolRef [symbol-name fn-ptr-ptr cur-decl cur-fn-ptr cur-dll-info invoker])
 
 (defn get-clr-type [ctype]
-  (if (is-reference-type? ctype)
-    IntPtr
-    (let [type-name (name ctype)]
-      (case type-name
-        "int8_t" SByte
-        "int16_t" Int16
-        "int32_t" Int32
-        "int64_t" Int64
-        "uint8_t" Byte
-        "uint16_t" UInt16
-        "uint32_t" UInt32
-        "uint64_t" UInt64
-        "bool" Boolean
-        "size_t" UIntPtr))))
+  (let [type-name (name ctype)]
+    (case type-name
+      "int8_t" SByte
+      "int16_t" Int16
+      "int32_t" Int32
+      "int64_t" Int64
+      "uint8_t" Byte
+      "uint16_t" UInt16
+      "uint32_t" UInt32
+      "uint64_t" UInt64
+      "bool" Boolean
+      "size_t" UIntPtr
+      "char*" String
+      (when (is-reference-type? ctype)
+        IntPtr))))
 
 (defn get-clr-params [params]
   (map (comp get-clr-type get-type) params))
+
+(defn- get-clr-type-size [^Type t]
+  (let [t (cond (= String t) IntPtr
+                :default t)]
+    (println t)
+    (Marshal/SizeOf (let [^Type t t] t))))
 
 (defn- get-proc-name [decl]
   (let [decl-type (get-type decl)]
     (if (is-function-type? decl-type)
       (let [{:keys [params]} decl-type
             clr-params (get-clr-params params)
-            args-size (reduce + (map #(min (let [^Type t %] (Marshal/SizeOf t)) 4) clr-params))]
+            args-size (reduce + (map #(min (get-clr-type-size %) 4) clr-params))]
         (str "_" (name decl) "@" args-size)))))
 
 (defn- get-dg-type [ret-type param-types]
@@ -208,3 +215,16 @@
 (cpackage TestMsvcModule "test1")
 
 (cdefn ^i32 t1 [^i32 x] (+ x 1))
+
+(cdefn ^char* t2 [] "Hello World!")
+
+(cdefn ^char* t3 [^char* str0]
+       (aset str0 0 \b)
+       str0)
+
+(cstruct T1
+         (i32 a))
+
+(cdefn ^void t4 []
+       (declare ^T1 x)
+       (set! (. x a) 5))
