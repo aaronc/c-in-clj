@@ -7,10 +7,11 @@
 ** cstatement
 ** c*
 ** no more reify
+** reduce parens
 * symbol parsing
 ** member access (.member)
 ** void$i32+i64 function pointer syntax, int! int!4 array syntax
-* array literals
+** array literals
 * anonymous functions (fn...)
 * type inference 
 * block rewriting of all operators
