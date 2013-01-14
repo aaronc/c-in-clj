@@ -1,7 +1,18 @@
-* IDeclaration
-* create define-type fn
-* void$i32+i64 function pointer syntax, int! int!4 array syntax
+* IDeclaration's
+** FunctionDeclaraton
+** GlobalVariableDeclaration
+** Struct
+** Typedef
+* Expressions
+** cstatement
+** c*
+** no more reify
+* symbol parsing
+** member access (.member)
+** void$i32+i64 function pointer syntax, int! int!4 array syntax
 * array literals
 * anonymous functions (fn...)
-
-
+* type inference 
+* block rewriting of all operators
+* compilation
+** save id??
