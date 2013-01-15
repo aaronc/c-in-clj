@@ -231,6 +231,9 @@ Usage: (dispatch-hook #'hook-map)."
 (def ^:private save-id (atom 0))
 
 (defn add-referenced-decl [resolved]
+  ;; (println "trying to add ref to" resolved
+  ;;          (satisfies? IDeclaration resolved)
+  ;;          *referenced-decls*)
   (when (and (satisfies? IDeclaration resolved) *referenced-decls*)
     (set! *referenced-decls*
           (conj *referenced-decls* resolved))))
@@ -1030,15 +1033,30 @@ Usage: (dispatch-hook #'hook-map)."
             (add-symbol package func-decl)
             func-decl))))))
 
+(defn- write-dev-header [referenced-decls]
+  (let [already-referenced *referenced-decls*]
+    (let [header
+          (str/join "\n\n" (doall (map write-decl referenced-decls)))
+          new-refs (set/difference *referenced-decls* already-referenced )]
+      (if (empty? new-refs)
+        header
+        (str (write-dev-header new-refs) "\n\n" header)))))
+
 (defn- output-dev-src [package decls cpp-mode preamble temp-output-path]
   (binding [*dynamic-compile* true]
     (let [anon-header (str/join "\n\n" (doall
-                                        (for [decl @(:declarations package)]
-                                          (when-not (name decl)
-                                            (write-decl decl)))))
-          referenced (apply set/union (map :referenced-decls decls))
-          header (str/join "\n\n" (doall (map write-decl referenced)))
-          body (str/join "\n\n" (doall (map write-impl decls)))
+                                        (remove
+                                         nil?
+                                         (for [decl @(:declarations package)]
+                                           (when-not (name decl)
+                                             (write-decl decl))))))
+          ;;referenced (apply set/union (map :referenced-decls decls))
+          [body referenced] (binding [*referenced-decls* #{}]
+                              [(str/join "\n\n" (doall (map write-impl decls)))
+                               *referenced-decls*])
+          header (binding [*referenced-decls* #{}]
+                   (write-dev-header referenced))
+          header (str/trim header)
           src (str/join "\n" [preamble anon-header header "\n" body])
           filename (str/join  "_" (map name decls))
           ;; TODO save id??
@@ -1085,11 +1103,14 @@ Usage: (dispatch-hook #'hook-map)."
   (write-impl [_])
   (decl-package [_] package)
   IType
-  (write-type [_] typedef-name)
+  (write-type [this]
+    (add-referenced-decl this)
+    typedef-name)
   (write-decl-expr
     [this var-name] (write-decl-expr this var-name 0))
   (write-decl-expr
-    [_ var-name pointer-depth]
+    [this var-name pointer-depth]
+    (add-referenced-decl this)
     (str typedef-name (apply str (repeat pointer-depth "*"))
          " " var-name))
   (is-reference-type? [_] (is-reference-type? target-type))
