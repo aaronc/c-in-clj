@@ -241,6 +241,8 @@ Usage: (dispatch-hook #'hook-map)."
   IType
   (write-type [_] type-name)
   (write-decl-expr [_ var-name] (str type-name " " var-name))
+  (write-decl-expr [_ var-name pointer-depth]
+    (str type-name (apply str (repeat pointer-depth "*")) " " var-name))
   (is-reference-type? [_] false)
   (is-function-type? [_] false)
   (common-denominator-type [_ _]))
@@ -287,7 +289,10 @@ Usage: (dispatch-hook #'hook-map)."
   (getName [_] (str (name type) "*"))
   IType
   (write-type [_] (str (write-type type) "*"))
-  (write-decl-expr [_ var-name] (str (write-type type) "* " var-name))
+  (write-decl-expr [_ var-name]
+    (write-decl-expr type var-name 1))
+  (write-decl-expr [_ var-name pointer-depth]
+    (write-decl-expr type var-name (inc pointer-depth)))
   (is-function-type? [_]
     (is-function-type? type))
   (is-reference-type? [_] true)
@@ -359,8 +364,9 @@ Usage: (dispatch-hook #'hook-map)."
 
 (defn- write-function-type [{:keys [return-type params]}
                             pointer-depth name?]
-  (str (write-type return-type) " (" name?
-       (apply str (repeat pointer-depth "*")) ")("
+  (str (write-type return-type) " ("
+       (apply str (repeat pointer-depth "*"))
+       name? ")("
        (str/join ", " (map write params)) ")"))
 
 (defrecord FunctionType [return-type params]
@@ -369,6 +375,8 @@ Usage: (dispatch-hook #'hook-map)."
     (write-function-type this 0 nil))
   (write-decl-expr [this var-name]
     (write-function-type this 0 var-name))
+  (write-decl-expr [this var-name pointer-depth]
+    (write-function-type this pointer-depth var-name))
   (is-reference-type? [this] false)
   (is-function-type? [_] true))
 
@@ -983,41 +991,44 @@ Usage: (dispatch-hook #'hook-map)."
 (defmacro cstruct [name & members]
   (compile-cstruct name members))
 
+(defn- parse-fn-params [params]
+  (for [param params]
+    (let [metadata (meta param)
+          param-name (name param)
+          param-type (lookup-type (:tag metadata))]
+      (FunctionParameter. param-name param-type metadata nil))))
+
 (defn parse-cfn [package [func-name & forms]]
   (let [f1 (first forms)
         doc-str (when (string? f1) f1)
         params (if doc-str (second forms) f1)
-        body-forms (if doc-str (nnext forms) (next forms))
-        params (for [param params]
-                      (let [metadata (meta param)
-                            param-name (name param)
-                            param-type (lookup-type (:tag metadata))]
-                        (FunctionParameter. param-name param-type metadata nil)))]
-    (binding [*locals* (into {} (for [param params] [(name param) param]))
-              *local-decls* []
-              *referenced-decls* #{}]
-      (let [body-forms (or body-forms [(ReturnExpression. nil)])
-            body-statements (vec (map cstatement body-forms)) 
-            local-decls (vec (map cstatement *local-decls*))
-            body-statements (concat local-decls body-statements)
-            body-block (if (and (= 1 (count body-statements))
-                                (= :block (expr-category (first body-statements))))
-                         (first body-statements)
-                         (BlockExpression. body-statements))
-            body-block (wrap-last
-                        body-block
-                        (fn [expr]
-                          (if (instance? ReturnExpression expr)
-                            expr
-                            (ReturnExpression. expr))))
-            func-metadata (meta func-name)
-            func-name (name func-name)
-            ret-type (lookup-type (:tag func-metadata))
+        body-forms (if doc-str (nnext forms) (next forms))]
+    (binding [*referenced-decls* #{}]
+      (let [params (parse-fn-params params)]
+        (binding [*locals* (into {} (for [param params] [(name param) param]))
+                  *local-decls* []]
+          (let [body-forms (or body-forms [(ReturnExpression. nil)])
+                body-statements (vec (map cstatement body-forms)) 
+                local-decls (vec (map cstatement *local-decls*))
+                body-statements (concat local-decls body-statements)
+                body-block (if (and (= 1 (count body-statements))
+                                    (= :block (expr-category (first body-statements))))
+                             (first body-statements)
+                             (BlockExpression. body-statements))
+                body-block (wrap-last
+                            body-block
+                            (fn [expr]
+                              (if (instance? ReturnExpression expr)
+                                expr
+                                (ReturnExpression. expr))))
+                func-metadata (meta func-name)
+                func-name (name func-name)
+                ret-type (lookup-type (:tag func-metadata))
 
-            func-type (FunctionType. ret-type params)
-            func-decl (FunctionDeclaration. package func-name func-type body-block *referenced-decls* func-metadata nil)]
-        (add-symbol package func-decl)
-        func-decl))))
+                func-type (FunctionType. ret-type params)
+                func-decl (FunctionDeclaration. package func-name func-type body-block *referenced-decls* func-metadata nil)]
+            (add-symbol package func-decl)
+            func-decl))))))
 
 (defn- output-dev-src [package decls cpp-mode preamble temp-output-path]
   (binding [*dynamic-compile* true]
@@ -1028,12 +1039,11 @@ Usage: (dispatch-hook #'hook-map)."
           referenced (apply set/union (map :referenced-decls decls))
           header (str/join "\n\n" (doall (map write-decl referenced)))
           body (str/join "\n\n" (doall (map write-impl decls)))
-          src (str/join "\n" [preamble anon-header header body])
+          src (str/join "\n" [preamble anon-header header "\n" body])
           filename (str/join  "_" (map name decls))
           ;; TODO save id??
           filename (str (name package) "_" filename "_" (swap! save-id inc) (if cpp-mode ".cpp" ".c"))
           filename (Path/Combine temp-output-path filename)]
-      (println referenced)
       (File/WriteAllText filename src)
       (CompileSource. src body filename))))
 
@@ -1064,6 +1074,48 @@ Usage: (dispatch-hook #'hook-map)."
   `(c-in-clj.core/cdefn ^:private ~@forms))
 
 (defmacro cdefns [])
+
+(defrecord TypeDef [package typedef-name target-type]
+  clojure.lang.Named
+  (getName [_] typedef-name)
+  IHasType
+  (get-type [_] target-type)
+  IDeclaration
+  (write-decl [_] (str "typedef " (write-decl-expr target-type typedef-name) ";"))
+  (write-impl [_])
+  (decl-package [_] package)
+  IType
+  (write-type [_] typedef-name)
+  (write-decl-expr
+    [this var-name] (write-decl-expr this var-name 0))
+  (write-decl-expr
+    [_ var-name pointer-depth]
+    (str typedef-name (apply str (repeat pointer-depth "*"))
+         " " var-name))
+  (is-reference-type? [_] (is-reference-type? target-type))
+  (is-function-type? [_] (is-function-type? target-type))
+  (common-denominator-type [_ other-type]
+    (common-denominator-type target-type other-type))
+  (get-fields [_] (get-fields target-type))
+  (create-field-access-expr [_ instance-expr field-name]
+    (create-field-access-expr target-type instance-expr field-name)))
+
+(defn ctypedef* [target-type typedef-name]
+  (let [package (get-package)
+        typedef-name (name typedef-name)
+        target-type (lookup-type target-type)
+        decl (TypeDef. package typedef-name target-type)]
+    (add-type package decl)
+    (write-decl decl)))
+
+(defmacro ctypedef [target-type typedef-name]
+  (ctypedef* target-type typedef-name))
+
+(defmacro ctypedeffn [typedef-name params]
+  (let [return-type (lookup-type (:tag (meta typedef-name)))
+        params (parse-fn-params params)
+        func-ptr-type (PointerType. (FunctionType. return-type params))]
+    (ctypedef* func-ptr-type typedef-name)))
 
 ;; ;;; Test code
 (csource-module TestModule :dev true)
