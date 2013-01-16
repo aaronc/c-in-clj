@@ -28,7 +28,9 @@
   (create-implicit-cast-expr [this expr])
   (create-explicit-cast-expr [this expr])
   (get-fields [this])
-  (create-field-access-expr [this instance-expr field-name]))
+  (create-field-access-expr
+    [this instance-expr field-name]
+    [this instance-expr field-name pointer-depth]))
 
 (defprotocol IDeclaration
   (write-decl [this])
@@ -483,6 +485,7 @@ Usage: (dispatch-hook #'hook-map)."
      (DoubleLiteral. x))))
 
 (defn lookup-symbol [sym-name]
+  (println "looking up" sym-name)
   (let [resolved-symbol
         (if (keyword? sym-name)
           (name sym-name)
@@ -693,16 +696,32 @@ Usage: (dispatch-hook #'hook-map)."
 
 ;; (cintrinsic 'c* c*)
 
+(defrecord StructFieldAccessExpression [instance-expr member-info pointer-depth]
+  IHasType
+  (get-type [_] (get-type member-info))
+  IExpression
+  (expr-category [_])
+  (write [_]
+    (let [prefix-pointer (when (>= pointer-depth 2)
+                           (- pointer-depth 2))
+          pointer-depth (if prefix-pointer 1
+                            pointer-depth)]
+      (str
+       (when prefix-pointer
+         (apply str "(" (repeat prefix-pointer "*")))
+       (write instance-expr)
+       (when prefix-pointer ")")
+       (case pointer-depth
+         0 "."
+         1 "->")
+       (name member-info)))))
+
 (cintrinsic* '.
-     (fn [& args]
-       (let [args (map cexpand args)]
-         (reify
-           IHasType
-           (get-type [_])
-           IExpression
-           (expr-category [_])
-           (write [_]
-             (str/join "." (map write args)))))))
+     (fn [instance-expr member-name & args]
+       (let [instance-expr (cexpand instance-expr)
+             args (map cexpand args)
+             instance-type (get-type instance-expr)]
+         )))
 
 (cintrinsic* '->
             (fn [& args]
@@ -992,11 +1011,16 @@ Usage: (dispatch-hook #'hook-map)."
     (str struct-name " " var-name))
   (create-explicit-cast-expr [this expr]
     (DefaultCastExpression. this expr))
+  (get-fields [this] fields)
+  (create-field-access-expr [this instance-expr field-name])
+  (create-field-access-expr [this instance-expr field-name pointer-depth]
+    (when-let [field (get fields (name field-name))]
+      (StructFieldAccessExpression. instance-expr field pointer-depth)))
   IDeclaration
   (write-decl [_]
     (str "typedef struct " struct-name " {\n"
        (str/join
-        (for [field fields]
+        (for [[field-name field] fields]
           (str " "
                (write-decl-expr (get-type field)
                                 (name field))
@@ -1012,8 +1036,10 @@ Usage: (dispatch-hook #'hook-map)."
         (Struct.
          package
          (name struct-name)
-         (for [[type-name field-name bits] members]
-           (StructField. (name field-name) (name type-name) bits)))]
+         (into (array-map)
+               (for [[type-name field-name bits] members]
+                 [(name field-name)
+                  (StructField. (name field-name) (name type-name) bits)])))]
     (add-type package struct)
     (write-decl struct)))
 

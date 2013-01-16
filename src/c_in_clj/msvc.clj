@@ -159,8 +159,17 @@
 
 (msvc-hook
  :alternate-function-declaration
- [ctxt decl]
- (when *dynamic-compile*))
+ [{:keys [compiled-symbols]} decl]
+ (when *dynamic-compile*
+   (let [sym-name (name decl)
+   ;;      {:keys [fn-ptr-ptr cur-decl]} (get @compiled-symbols sym-name)
+   ;;      fn-type (get-type @cur-decl)
+         ;(str "(*(" cret "(**)(" param-sig "))" fn-ptr-ptr ")")
+         ;fn-def (str "#define " fn-name " " fn-const "\n")
+         ]
+     ;; (println fn-type)
+     (println sym-name)
+     )))
 
 (defn- msvc-write-hook [ctxt hook-name expr]
   (dispatch-hook #'msvc-hook hook-name ctxt expr))
@@ -234,3 +243,6 @@
 ;; (cdefn ^void t4 []
 ;;        (declare ^T1 x)
 ;;        (set! (. x a) 5))
+
+(cdefn ^i32 t5 []
+       (t1 3))
