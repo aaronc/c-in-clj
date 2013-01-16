@@ -91,6 +91,13 @@
 (defprotocol IPackage
   (add-declaration [this decl]))
 
+(defn look-in-referenced-packages [referenced-packages target-sym accessor]
+  (loop [[rp more] (vec @referenced-packages)]
+    (when rp
+      (if-let [s (get @(get rp accessor) target-sym)]
+        s
+        (recur more)))))
+
 (defrecord Package [package-name module declarations public-symbols public-types private-symbols private-types referenced-packages]
   clojure.lang.Named
   (getName [_] package-name)
@@ -111,6 +118,9 @@
   (resolve-symbol [_ sym-name]
     (or (get @private-symbols sym-name)
         (get @public-symbols sym-name)
+        (look-in-referenced-packages referenced-packages
+                                     sym-name
+                                     :public-symbols)
         (resolve-symbol module sym-name)))
   ITypeScope
   (add-type [this decl]
@@ -121,6 +131,9 @@
   (resolve-type [_ type-name]
     (or (get @private-types type-name)
         (get @public-types type-name)
+        (look-in-referenced-packages referenced-packages
+                                     type-name
+                                     :public-types)
         (resolve-type module type-name))))
 
 (defmethod print-method Package [o w]
@@ -181,13 +194,15 @@
       (constantly null-loader-context)
       ~opts)))
 
-(defn cpackage [module package-name]
-  (let [package (cond (instance? Module module)
+(defmacro cpackage [module package-sym]
+  (let [module (eval module)
+        package-name (name package-sym)
+        package (cond (instance? Module module)
                (Package. package-name module (atom []) (atom {}) (atom {}) (atom {}) (atom {}) (atom #{}))
                (instance? RuntimeModule module)
                (RuntimePackage. package-name module))]
     (swap! packages-by-ns assoc *ns* package)
-    package))
+    `(def ~package-sym ~package)))
 
 (defn get-package [] (get @packages-by-ns *ns*))
 
@@ -243,7 +258,7 @@ Usage: (dispatch-hook #'hook-map)."
   IHasType
   (get-type [_] target-type)
   IExpression
-  (write [_] (str "(" (write-type target-type) ")" (write expr)))
+  (write [_] (str "((" (write-type target-type) ")" (write expr) ")"))
   (expr-category [_]))
 
 (defrecord PrimitiveType [type-name]
@@ -309,7 +324,11 @@ Usage: (dispatch-hook #'hook-map)."
   (is-reference-type? [_] true)
   (get-fields [_])
   (create-explicit-cast-expr [this expr]
-    (DefaultCastExpression. this expr)))
+    (DefaultCastExpression. this expr))
+  (create-field-access-expr [this instance-expr member-name]
+    (create-field-access-expr this instance-expr member-name 1))
+  (create-field-access-expr [this instance-expr member-name pointer-depth]
+    (create-field-access-expr type instance-expr member-name pointer-depth)))
 
 (defrecord AnonymousType [type-name]
   clojure.lang.Named
@@ -485,7 +504,6 @@ Usage: (dispatch-hook #'hook-map)."
      (DoubleLiteral. x))))
 
 (defn lookup-symbol [sym-name]
-  (println "looking up" sym-name)
   (let [resolved-symbol
         (if (keyword? sym-name)
           (name sym-name)
@@ -512,9 +530,10 @@ Usage: (dispatch-hook #'hook-map)."
     (if-let [intrinsic (@cintrinsics sym)]
       (apply intrinsic args)
       (if (.StartsWith sym-name ".") ;; Member access
-        (cexpand-op-sym '. (concat '((first args)
-                                     (.Substring sym-name 1))
-                                   (rest args)))
+        (cexpand-op-sym '. (apply vector
+                                  (first args)
+                                  (.Substring sym-name 1)
+                                  (rest args)))
         (if-let [macro (lookup-macro sym)]
           (cexpand (apply macro args))
           (if-let [local-func (get *locals* sym)]
@@ -560,16 +579,6 @@ Usage: (dispatch-hook #'hook-map)."
                (fn ~sym ~args
                  (let [~@ (reduce (fn [res x] (into res [x `(cexpand ~x)])) [] args)]
                    ~@body))))
-
-(defn- sanitize-class-name [name]
-  (reduce (fn [name [orig sub]] (str/replace name orig sub))
-          (partition 2
-                     ["+" "PLUS"
-                      "=" "EQ"
-                      ">" "GT"
-                      "<" "LT"
-                      "!" "BANG"
-                      ""])))
 
 (defn- get-expr-record-sym [sym]
   (symbol (clojure.lang.Compiler/munge
@@ -639,11 +648,12 @@ Usage: (dispatch-hook #'hook-map)."
                      (fn [x#] (new ~rec-sym target# x#)))
           (new ~rec-sym target# source#))))))
 
-(cbinops + - * /  += -= *= /= %= <<= >>=)
-(compops += -= *= /= %= <<= >>=)
+(cbinops + - * / += -= *= /=)
+(compops < > <= >=)
 (compop* = "==")
 (compop* not= "!=")
 (cbinop* mod "%")
+(cassignop mod= "%=")
 (compop* or "||")
 (compop* and "&&")
 (cbinop* bit-or "|")
@@ -717,11 +727,15 @@ Usage: (dispatch-hook #'hook-map)."
        (name member-info)))))
 
 (cintrinsic* '.
-     (fn [instance-expr member-name & args]
-       (let [instance-expr (cexpand instance-expr)
-             args (map cexpand args)
-             instance-type (get-type instance-expr)]
-         )))
+             (fn [instance-expr member-name & args]
+               (let [instance-expr (cexpand instance-expr)
+                     instance-type (get-type instance-expr)
+                     access-expr (create-field-access-expr
+                    instance-type instance-expr member-name)]
+                 (if args
+                   (let [args (map cexpand args)]
+                     )
+                   access-expr))))
 
 (cintrinsic* '->
             (fn [& args]
@@ -1007,8 +1021,11 @@ Usage: (dispatch-hook #'hook-map)."
   (is-function-type? [_] false)
   (is-reference-type? [_] false)
   (write-decl-expr [this var-name]
+    (write-decl-expr this var-name 0))
+  (write-decl-expr [this var-name pointer-depth]
     (add-referenced-decl this)
-    (str struct-name " " var-name))
+    (str struct-name (apply str (repeat pointer-depth "*"))
+         " " var-name))
   (create-explicit-cast-expr [this expr]
     (DefaultCastExpression. this expr))
   (get-fields [this] fields)
@@ -1030,7 +1047,7 @@ Usage: (dispatch-hook #'hook-map)."
   (write-impl [_])
   (decl-package [_] package))
 
-(defn- compile-cstruct [struct-name members]
+(defn cstruct* [struct-name members]
   (let [package (get-package)
         struct
         (Struct.
@@ -1041,10 +1058,10 @@ Usage: (dispatch-hook #'hook-map)."
                  [(name field-name)
                   (StructField. (name field-name) (name type-name) bits)])))]
     (add-type package struct)
-    (write-decl struct)))
+    (println (write-decl struct))))
 
 (defmacro cstruct [name & members]
-  (compile-cstruct name members))
+  (cstruct* name members))
 
 (cintrinsic*
  'cast
@@ -1084,6 +1101,9 @@ Usage: (dispatch-hook #'hook-map)."
                                 expr
                                 (ReturnExpression. expr))))
                 func-metadata (meta func-name)
+                func-metadata (if doc-str
+                                (assoc func-metadata :doc doc-str)
+                                func-metadata)
                 func-name (name func-name)
                 ret-type (lookup-type (:tag func-metadata))
 
@@ -1096,7 +1116,8 @@ Usage: (dispatch-hook #'hook-map)."
   (let [already-referenced *referenced-decls*]
     (let [header
           (str/join "\n\n" (doall (map write-decl referenced-decls)))
-          new-refs (set/difference *referenced-decls* already-referenced )]
+          already-referenced (set/union already-referenced referenced-decls)
+          new-refs (set/difference *referenced-decls* already-referenced)]
       (if (empty? new-refs)
         header
         (str (write-dev-header new-refs) "\n\n" header)))))
@@ -1144,13 +1165,25 @@ Usage: (dispatch-hook #'hook-map)."
         (doseq [[func-name & forms] funcs]
           (load-symbol loader (:name package) func-name))))))
 
-(defmacro cdefn [& forms]
+(defn cdefn* [& forms]
   (compile-cfns [forms]))
+
+(defmacro cdefn [& forms]
+  (apply cdefn* forms))
 
 (defmacro cdefn- [& forms]
   `(c-in-clj.core/cdefn ^:private ~@forms))
 
 (defmacro cdefns [])
+
+(defn unqualify-symbols [form]
+  (if (seq? form)
+    (apply list
+           (for [f form]
+             (unqualify-symbols f)))
+    (if (symbol? form)
+      (symbol (name form))
+      form)))
 
 (defrecord TypeDef [package typedef-name target-type]
   clojure.lang.Named
@@ -1252,15 +1285,20 @@ Usage: (dispatch-hook #'hook-map)."
     (add-type package enum)
     (doseq [v values]
       (add-symbol package v))
-    (write-decl enum)))
+    (println (write-decl enum))))
 
 (defmacro cenum [enum-name values]
   (cenum* enum-name values))
 
+(defn cinclude [package-or-include]
+  (if (satisfies? IPackage package-or-include)
+    (swap! (:referenced-packages (get-package)) conj package-or-include)
+    (throw (Exception. "include decl not implemented"))))
+
 ;; ;;; Test code
 (csource-module TestModule :dev true)
 
-(cpackage TestModule "test1")
+(cpackage TestModule test1)
 
-(cdefn ^void t1 [^i32 x]
-       (+ x 1))
+;; (cdefn ^void t1 [^i32 x]
+;;        (+ x 1))

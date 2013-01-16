@@ -179,7 +179,10 @@
   (write-hook [this hook-name expr]
     (msvc-write-hook this hook-name expr))
   (compile-decls [this decls compile-source]
-    (msvc-compile-decls this decls compile-source)))
+    (msvc-compile-decls this decls compile-source))
+  ITypeScope
+  (resolve-type [_ type-name]
+    (throw (Exception. (str "Unable to resolve type " type-name)))))
 
 (defn- init-cl-bat [temp-output-path msvc-path]
   (let [cl-bat-path (Path/Combine temp-output-path "cl.bat")
