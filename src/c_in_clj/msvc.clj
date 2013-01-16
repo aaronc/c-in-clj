@@ -63,7 +63,6 @@
 (defn- get-clr-type-size [^Type t]
   (let [t (cond (= String t) IntPtr
                 :default t)]
-    (println t)
     (Marshal/SizeOf (let [^Type t t] t))))
 
 (defn- get-proc-name [decl]
@@ -117,10 +116,17 @@
                      (println "Found existing symbol ref for" sym-name)
                      (swap! references disj @cur-decl)
                      (when (empty? @references)
-                       (println "Cleaning up" source-file)
                        (swap! dll-handles disj @cur-dll-info)
                        (FreeLibrary dll-handle)
-                       (File/Delete source-file))
+                       (let [wcard-name (Path/ChangeExtension source-file "*")
+                             wcard-fname (Path/GetFileName wcard-name)
+                             dir-name (Path/GetDirectoryName wcard-name)]
+                         (println "Cleaning up" wcard-fname "in" dir-name)
+                         (doseq [fname (Directory/EnumerateFiles dir-name wcard-fname)]
+                           (try
+                             (File/Delete fname)
+                             (catch Exception ex
+                               (println "Error deleting" fname ":" ex))))))
                      (reset! invoker new-invoker)
                      (reset! cur-fn-ptr new-fn-ptr)
                      (reset! cur-dll-info new-dll-info)
