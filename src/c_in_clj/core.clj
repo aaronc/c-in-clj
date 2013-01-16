@@ -1,4 +1,3 @@
-;; (Environment/SetEnvironmentVariable "CLOJURE_LOAD_PATH" (str (Environment/ExpandEnvironmentVariables "%USERPROFILE%/dev/c-in-clj/src") (Environment/GetEnvironmentVariable "CLOJURE_LOAD_PATH")))
 (ns c-in-clj.core
   (:require [clojure.string :as str]
             [clojure.set :as set])
@@ -24,8 +23,7 @@
   (is-reference-type? [this])
   (is-function-type? [this])
   (create-new-expr
-    [this args]
-    [this args pointer-depth])
+    [this args])
   (common-denominator-type [this other-type])
   (create-implicit-cast-expr [this expr])
   (create-explicit-cast-expr [this expr])
@@ -96,11 +94,12 @@
   (getName [_] package-name)
   IPackage
   (add-declaration [this decl]
-    (let [decl-name (name decl)
-          existing-idx (find-index-of @declarations #(= (name %) decl-name))]
-      (if existing-idx
-        (swap! declarations assoc existing-idx decl)
-        (swap! declarations conj decl))))
+    (when (satisfies? IDeclaration decl)
+      (let [decl-name (name decl)
+            existing-idx (find-index-of @declarations #(= (name %) decl-name))]
+        (if existing-idx
+          (swap! declarations assoc existing-idx decl)
+          (swap! declarations conj decl)))))
   ISymbolScope
   (add-symbol [this decl]
     (add-declaration this decl)
@@ -108,8 +107,8 @@
       (swap! private-symbols assoc (name decl) decl)
       (swap! public-symbols assoc (name decl) decl)))
   (resolve-symbol [_ sym-name]
-    (or (get private-symbols sym-name)
-        (get public-symbols sym-name)
+    (or (get @private-symbols sym-name)
+        (get @public-symbols sym-name)
         (resolve-symbol module sym-name)))
   ITypeScope
   (add-type [this decl]
@@ -238,6 +237,13 @@ Usage: (dispatch-hook #'hook-map)."
     (set! *referenced-decls*
           (conj *referenced-decls* resolved))))
 
+(defrecord DefaultCastExpression [target-type expr]
+  IHasType
+  (get-type [_] target-type)
+  IExpression
+  (write [_] (str "(" (write-type target-type) ")" (write expr)))
+  (expr-category [_]))
+
 (defrecord PrimitiveType [type-name]
   clojure.lang.Named
   (getName [_] type-name)
@@ -299,7 +305,9 @@ Usage: (dispatch-hook #'hook-map)."
   (is-function-type? [_]
     (is-function-type? type))
   (is-reference-type? [_] true)
-  (get-fields [_]))
+  (get-fields [_])
+  (create-explicit-cast-expr [this expr]
+    (DefaultCastExpression. this expr)))
 
 (defrecord AnonymousType [type-name]
   clojure.lang.Named
@@ -481,7 +489,7 @@ Usage: (dispatch-hook #'hook-map)."
           (let [sym-name (name sym-name)]
             (if-let [local (get *locals* sym-name)]
               (VariableRefExpression. local)
-              (lookup-symbol (get-package)))))]
+              (resolve-symbol (get-package) sym-name))))]
     (add-referenced-decl resolved-symbol)
     resolved-symbol))
 
@@ -489,16 +497,28 @@ Usage: (dispatch-hook #'hook-map)."
 
 (def ^:private cintrinsics (atom {}))
 
+(defn- cexpand-member-access [sym args]
+  (let [sym-name (name sym)
+        target (first args)
+        args (rest args)
+        target (lookup-symbol target)]
+    ))
+
 (defn cexpand-op-sym [sym args]
-  (if-let [intrinsic (@cintrinsics sym)]
-    (apply intrinsic args)
-    (if-let [macro (lookup-macro sym)]
-      (cexpand (apply macro args))
-      (if-let [local-func (get *locals* sym)]
-        (AnonymousFunctionCallExpression. (name sym) (map cexpand args))
-        (if-let [defined (lookup-symbol sym)]
-          (FunctionCallExpression. defined (map cexpand args))
-          (throw (ArgumentException. (str "Don't know how to handle list symbol " sym))))))))
+  (let [sym-name (name sym)]
+    (if-let [intrinsic (@cintrinsics sym)]
+      (apply intrinsic args)
+      (if (.StartsWith sym-name ".") ;; Member access
+        (cexpand-op-sym '. (concat '((first args)
+                                     (.Substring sym-name 1))
+                                   (rest args)))
+        (if-let [macro (lookup-macro sym)]
+          (cexpand (apply macro args))
+          (if-let [local-func (get *locals* sym)]
+            (AnonymousFunctionCallExpression. (name sym) (map cexpand args))
+            (if-let [defined (lookup-symbol sym)]
+              (FunctionCallExpression. defined (map cexpand args))
+              (throw (ArgumentException. (str "Don't know how to handle list symbol " sym))))))))))
 
 (defn cexpand-list [[op & args]]
   (cond
@@ -962,10 +982,16 @@ Usage: (dispatch-hook #'hook-map)."
   IHasType
   (get-type [this] this)
   IType
+  (write-type [this]
+    (add-referenced-decl this)
+    struct-name)
   (is-function-type? [_] false)
   (is-reference-type? [_] false)
-  (write-decl-expr [_ var-name]
+  (write-decl-expr [this var-name]
+    (add-referenced-decl this)
     (str struct-name " " var-name))
+  (create-explicit-cast-expr [this expr]
+    (DefaultCastExpression. this expr))
   IDeclaration
   (write-decl [_]
     (str "typedef struct " struct-name " {\n"
@@ -987,12 +1013,19 @@ Usage: (dispatch-hook #'hook-map)."
          package
          (name struct-name)
          (for [[type-name field-name bits] members]
-           (StructField. (name field-name) type-name bits)))]
+           (StructField. (name field-name) (name type-name) bits)))]
     (add-type package struct)
     (write-decl struct)))
 
 (defmacro cstruct [name & members]
   (compile-cstruct name members))
+
+(cintrinsic*
+ 'cast
+ (fn [target-type expr]
+   (let [target-type (lookup-type target-type)
+         expr (cexpand expr)]
+     (create-explicit-cast-expr target-type expr))))
 
 (defn- parse-fn-params [params]
   (for [param params]
@@ -1121,22 +1154,82 @@ Usage: (dispatch-hook #'hook-map)."
   (create-field-access-expr [_ instance-expr field-name]
     (create-field-access-expr target-type instance-expr field-name)))
 
-(defn ctypedef* [target-type typedef-name]
+(defn ctypedef* [target-type typedef-name metadata]
   (let [package (get-package)
         typedef-name (name typedef-name)
         target-type (lookup-type target-type)
-        decl (TypeDef. package typedef-name target-type)]
+        decl (TypeDef. package typedef-name target-type metadata nil)]
     (add-type package decl)
     (write-decl decl)))
 
-(defmacro ctypedef [target-type typedef-name]
-  (ctypedef* target-type typedef-name))
+(defmacro ctypedef
+  ([target-type typedef-name]
+     (ctypedef* target-type typedef-name nil))
+  ([metadata target-type typedef-name]
+     (ctypedef* target-type typedef-name metadata)))
 
 (defmacro ctypedeffn [typedef-name params]
-  (let [return-type (lookup-type (:tag (meta typedef-name)))
+  (let [metadata (meta typedef-name)
+        return-type (lookup-type (:tag metadata))
         params (parse-fn-params params)
         func-ptr-type (PointerType. (FunctionType. return-type params))]
-    (ctypedef* func-ptr-type typedef-name)))
+    (ctypedef* func-ptr-type typedef-name metadata)))
+
+(defrecord EnumValue [name value base-type]
+  clojure.lang.Named
+  (getName [_] name)
+  IHasType
+  (get-type [_] base-type)
+  IExpression
+  (expr-category [_])
+  (write [_] name))
+
+(defrecord EnumType [package enum-name values]
+  clojure.lang.Named
+  (getName [_] enum-name)
+  IDeclaration
+  (write-decl [_] (str "enum " enum-name
+                       " {"
+                       (str/join
+                        ", "
+                        (map #(str (:name %) " = " (:value %)) values))
+                       "};"))
+  (write-impl [_])
+  (decl-package [_] package)
+  IType
+  (write-type [this]
+    (add-referenced-decl this)
+    enum-name)
+  (write-decl-expr
+    [this var-name] (write-decl-expr this var-name 0))
+  (write-decl-expr
+    [this var-name pointer-depth]
+    (add-referenced-decl this)
+    (str enum-name (apply str (repeat pointer-depth "*"))
+         " " var-name))
+  (is-reference-type? [_] false)
+  (is-function-type? [_] false)
+  (common-denominator-type [_ other-type])
+  (get-fields [_])
+  (create-field-access-expr [_ instance-expr field-name]))
+
+(defn- cenum* [enum-name values]
+  (let [package (get-package)
+        enum-name (name enum-name)
+        values (partition 2 values)
+        base-type (lookup-type "i32")
+        values (map #(EnumValue. (name (first %))
+                                 (second %)
+                                 base-type)
+                    values)
+        enum (EnumType. package enum-name values)]
+    (add-type package enum)
+    (doseq [v values]
+      (add-symbol package v))
+    (write-decl enum)))
+
+(defmacro cenum [enum-name values]
+  (cenum* enum-name values))
 
 ;; ;;; Test code
 (csource-module TestModule :dev true)
