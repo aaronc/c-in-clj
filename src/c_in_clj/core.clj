@@ -339,6 +339,16 @@ Usage: (dispatch-hook #'hook-map)."
   (is-reference-type? [_])
   (is-function-type? [_]))
 
+(defrecord StaticArrayType [underlying-type array-length]
+  clojure.lang.Named
+  (getName [_] (str (name underlying-type) "[" array-length "]"))
+  IType
+  (write-type [_] (str (write-type underlying-type) "[" array-length "]"))
+  (write-decl-expr [_ var-name] (str (write-decl-expr underlying-type var-name)
+                                     "[" array-length "]"))
+  (is-reference-type? [_] true)
+  (is-function-type? [_] false))
+
 (defn lookup-type [type-name]
   (let [resolved-type
         (cond
@@ -346,13 +356,20 @@ Usage: (dispatch-hook #'hook-map)."
          (keyword? type-name) (AnonymousType. (name type-name))
          :default
          (let [type-name (name type-name)]
-           (if-let [primitive (get @primitive-types type-name)]
-             primitive
-             (if-let [alias (get @type-aliases type-name)]
-               (lookup-type alias)
-               (if (.EndsWith type-name "*")
-                 (PointerType. (lookup-type (.Substring type-name 0 (dec (.Length type-name)))))
-                 (resolve-type (get-package) type-name))))))]
+           (if-let [[_ type-name array-len] (re-matches #"(.*)!([0-9])*" type-name)]
+             (let [underlying-type (lookup-type type-name)
+                   array-len (when-not (empty? array-len)
+                               (int array-len))]
+               (if array-len
+                 (StaticArrayType. underlying-type array-len)
+                 (PointerType. underlying-type)))
+             (if-let [primitive (get @primitive-types type-name)]
+               primitive
+               (if-let [alias (get @type-aliases type-name)]
+                 (lookup-type alias)
+                 (if (.EndsWith type-name "*")
+                   (PointerType. (lookup-type (.Substring type-name 0 (dec (.Length type-name)))))
+                   (resolve-type (get-package) type-name)))))))]
     (add-referenced-decl resolved-type)
     resolved-type))
 
@@ -554,6 +571,16 @@ Usage: (dispatch-hook #'hook-map)."
       :default (cexpand-list expanded args)))
    :default (throw (ArgumentException. (str "Don't know how to handle list starting with" op)))))
 
+(defrecord InitializerList [values]
+  IHasType
+  (get-type [_])
+  IExpression
+  (expr-category [_])
+  (write [_] (str "{" (str/join ", " (map write values)) "}")))
+
+(defn cexpand-vector [values]
+  (InitializerList. (map cexpand values)))
+
 (defn cexpand [form]
   (cond
    (satisfies? IExpression form) form
@@ -565,6 +592,7 @@ Usage: (dispatch-hook #'hook-map)."
    (symbol? form) (lookup-symbol form)
    (keyword? form) (AnonymousVariableRefExpression. (name form))
    (list? form) (cexpand-list form)
+   (vector? form) (cexpand-vector form)
    :default (throw (ArgumentException. (str "Don't know how to handle " form " of type " (type form))))))
 
 (defn is-block? [expr]
@@ -1294,6 +1322,30 @@ Usage: (dispatch-hook #'hook-map)."
   (if (satisfies? IPackage package-or-include)
     (swap! (:referenced-packages (get-package)) conj package-or-include)
     (throw (Exception. "include decl not implemented"))))
+
+(defrecord GlobalVariableDeclaration [package var-name var-type init-expr]
+  clojure.lang.Named
+  (getName [_] var-name)
+  IHasType
+  (get-type [_] var-type)
+  IDeclaration
+  (write-decl [_] (str "extern " (write-decl-expr var-type var-name) ";"))
+  (write-impl [_] (str (write-decl-expr var-type var-name) (when init-expr (str " = " (write init-expr))) ";")))
+
+(defn cdef*
+  ([var-name init-expr]
+     (let [package (get-package)
+           metadata (meta var-name)
+           var-name (name var-name)
+           var-type (lookup-type (:tag metadata))
+           init-expr (when init-expr (cexpand init-expr))
+           var-decl (GlobalVariableDeclaration. package var-name var-type
+                                                init-expr metadata nil)]
+       (add-symbol package var-decl)
+       (println (write-impl var-decl))))
+  ([var-name] (cdef* var-name nil)))
+
+(defmacro cdef [& forms] (apply cdef* forms))
 
 ;; ;;; Test code
 (csource-module TestModule :dev true)
