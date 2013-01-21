@@ -201,6 +201,8 @@
                (Package. package-name module (atom []) (atom {}) (atom {}) (atom {}) (atom {}) (atom #{}))
                (instance? RuntimeModule module)
                (RuntimePackage. package-name module))]
+    (when (instance? Module module)
+      (swap! (:packages module) assoc package-name package))
     (swap! packages-by-ns assoc *ns* package)
     `(def ~package-sym ~package)))
 
@@ -1084,7 +1086,9 @@ Usage: (dispatch-hook #'hook-map)."
          (into (array-map)
                (for [[type-name field-name bits] members]
                  [(name field-name)
-                  (StructField. (name field-name) (name type-name) bits)])))]
+                  (StructField. (name field-name) (name type-name) bits)]))
+         (meta struct-name)
+         nil)]
     (add-type package struct)
     (println (write-decl struct))))
 
@@ -1318,9 +1322,22 @@ Usage: (dispatch-hook #'hook-map)."
 (defmacro cenum [enum-name values]
   (cenum* enum-name values))
 
+(defrecord PackageIncludeDeclaration [package referenced-package]
+  clojure.lang.Named
+  (getName [_] (str (name referenced-package) ".h"))
+  IDeclaration
+  (decl-package [_] package)
+  (write-decl [_] (str "#include \"" (name referenced-package) ".h\""))
+  (write-impl [_]))
+
 (defn cinclude [package-or-include]
   (if (satisfies? IPackage package-or-include)
-    (swap! (:referenced-packages (get-package)) conj package-or-include)
+    (let [package (get-package)
+          referenced-pkg package-or-include
+          decl (PackageIncludeDeclaration. package referenced-pkg)]
+      (swap! (:referenced-packages (get-package)) conj package-or-include)
+      (add-declaration package decl)
+      decl)
     (throw (Exception. "include decl not implemented"))))
 
 (defrecord GlobalVariableDeclaration [package var-name var-type init-expr]
@@ -1344,6 +1361,50 @@ Usage: (dispatch-hook #'hook-map)."
        (add-symbol package var-decl)
        (println (write-impl var-decl))))
   ([var-name] (cdef* var-name nil)))
+
+(defn write-package-source [{:keys [declarations module] :as package} & {:keys [src-output-path cpp-mode]}]
+  (let [{:keys [preamble]} module
+        pkg-name (name package)
+        header-name (str pkg-name ".h")
+        include-guard-name (.ToUpper
+                            (str "_" (name module) "__" pkg-name "__H_"))
+        public-decls (filter #(not (:private (meta %))) @declarations)
+        private-decls (filter #(:private (meta %)) @declarations)
+        decl-src
+        (str "#ifndef " include-guard-name "\n"
+             "#define " include-guard-name "\n\n"
+             preamble
+             "\n"
+             (str/join "\n\n"
+                       (remove empty?
+                               (for [decl public-decls]
+                                 (write-decl decl))))
+             "\n\n#endif // " include-guard-name "\n")
+       
+        impl-src
+        (str
+         "#include \"" header-name "\"\n\n"
+         (str/join "\n\n"
+                   (remove empty?
+                           (concat
+                            (for [decl private-decls]
+                              (write-decl decl))
+                            (for [decl @declarations]
+                              (write-impl decl))))))]
+    (when src-output-path
+      (let [decl-path (Path/Combine src-output-path header-name)
+            impl-path (Path/Combine src-output-path
+                                    (str pkg-name
+                                         (if cpp-mode ".cpp" ".c")))]
+
+        (println "Writing" decl-path)
+        (println "Writing" impl-path)
+        (File/WriteAllText decl-path decl-src)
+        (File/WriteAllText impl-path impl-src)))))
+
+(defn write-module-source [{:keys [packages cpp-mode src-output-path] :as module}]
+  (doseq [[_ pkg] @packages]
+    (write-package-source pkg :cpp-mode cpp-mode :src-output-path src-output-path)))
 
 (defmacro cdef [& forms] (apply cdef* forms))
 

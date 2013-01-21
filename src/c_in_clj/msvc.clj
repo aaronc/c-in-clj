@@ -13,7 +13,7 @@
 
 (def default-msvc-path (Environment/ExpandEnvironmentVariables "%PROGRAMFILES(x86)%\\Microsoft Visual Studio 10.0\\VC"))
 
-(def default-msvc-args "user32.lib gdi32.lib kernel32.lib /EHs /Gz /LD")
+(def default-msvc-args "kernel32.lib user32.lib gdi32.lib winspool.lib comdlg32.lib advapi32.lib shell32.lib ole32.lib oleaut32.lib uuid.lib odbc32.lib odbccp32.lib /EHs /Gz /LD")
 
 (def ^:private dg-type-cache (atom {}))
 
@@ -230,7 +230,7 @@
 
 (msvc-module TestMsvcModule :dev true)
 
-(cpackage TestMsvcModule "test1")
+(cpackage TestMsvcModule test_msvc1)
 
 (cdefn ^i32 t1 [^i32 x] (+ x 1))
 
@@ -247,5 +247,5 @@
 ;;        (declare ^T1 x)
 ;;        (set! (. x a) 5))
 
-(cdefn ^i32 t5 []
-       (t1 3))
+;; (cdefn ^i32 t5 []
+;;        (t1 3))
