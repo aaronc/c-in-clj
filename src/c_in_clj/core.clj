@@ -92,7 +92,7 @@
   (add-declaration [this decl]))
 
 (defn look-in-referenced-packages [referenced-packages target-sym accessor]
-  (loop [[rp more] (vec @referenced-packages)]
+  (loop [[rp & more] (vec @referenced-packages)]
     (when rp
       (if-let [s (get @(get rp accessor) target-sym)]
         s
@@ -1330,15 +1330,26 @@ Usage: (dispatch-hook #'hook-map)."
   (write-decl [_] (str "#include \"" (name referenced-package) ".h\""))
   (write-impl [_]))
 
-(defn cinclude [package-or-include]
-  (if (satisfies? IPackage package-or-include)
-    (let [package (get-package)
-          referenced-pkg package-or-include
-          decl (PackageIncludeDeclaration. package referenced-pkg)]
-      (swap! (:referenced-packages (get-package)) conj package-or-include)
-      (add-declaration package decl)
-      decl)
-    (throw (Exception. "include decl not implemented"))))
+(defrecord IncludeDeclaration [package include-name]
+  clojure.lang.Named
+  (getName [_] include-name)
+  IDeclaration
+  (decl-package [_] package)
+  (write-decl [_] (str "#include <" include-name ">"))
+  (write-impl [_]))
+
+(defn cinclude [package-or-include & {:as opts}]
+  (let [package (get-package)]
+    (if (satisfies? IPackage package-or-include)
+      (let [referenced-pkg package-or-include
+            decl (PackageIncludeDeclaration. package referenced-pkg opts nil)]
+        (swap! (:referenced-packages (get-package)) conj package-or-include)
+        (add-declaration package decl)
+        decl)
+      (let [include-name package-or-include
+            decl (IncludeDeclaration. package include-name opts nil)]
+        (add-declaration package decl)
+        decl))))
 
 (defrecord GlobalVariableDeclaration [package var-name var-type init-expr]
   clojure.lang.Named
