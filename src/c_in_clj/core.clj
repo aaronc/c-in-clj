@@ -273,7 +273,9 @@ Usage: (dispatch-hook #'hook-map)."
     (str type-name (apply str (repeat pointer-depth "*")) " " var-name))
   (is-reference-type? [_] false)
   (is-function-type? [_] false)
-  (common-denominator-type [_ _]))
+  (common-denominator-type [_ _])
+  (create-explicit-cast-expr [this expr]
+    (DefaultCastExpression. this expr)))
 
 (defmacro defprimitive [type-name]
   (let [type-name (name type-name)]
@@ -446,7 +448,12 @@ Usage: (dispatch-hook #'hook-map)."
   IDeclaration
   (write-decl [this]
     (or (apply-hook :alternate-function-declaration this)
-        (str (write-function-signature this) ";")))
+        (str
+         (when-let [doc (:doc (meta this))]
+           (str "/**\n" 
+                (apply str (map #(str "* " % "\n") (str/split-lines doc)))
+                "*/\n"))
+         (write-function-signature this) ";")))
   (write-impl [this]
     (str (write-function-signature this) "\n"
          (write body)))
@@ -624,11 +631,10 @@ Usage: (dispatch-hook #'hook-map)."
       (cintrinsic ~sym ~args
                   (new ~rec-sym ~@args)))))
 
-(defn get-bin-op-type [x y]
-  (let [xt (get-type x)
-        yt (get-type y)]
-    (when (= xt yt)
-      xt)))
+(defn get-bin-op-type [& args]
+  (let [types (map get-type args)]
+    (when (apply = types)
+      (first types))))
 
 (defmacro cbinop [sym]
   `(cop ~sym [x# y#]
@@ -660,6 +666,29 @@ Usage: (dispatch-hook #'hook-map)."
         IHasType
         (get-type [this#] 'bool)))
 
+(defn reduce-parens [^String expr]
+  (when expr
+    (if (.StartsWith expr "(")
+      (let [len (.Length expr)
+            matching-paren-idx
+            (loop [idx 1
+                   depth 1]
+              (when (< idx len)
+                (let [ch (nth expr idx)]
+                  (cond
+                   (= \( ch)
+                   (recur (inc idx) (inc depth))
+                   (= \) ch)
+                   (if (= depth 1)
+                     idx
+                     (recur (inc idx) (dec depth)))
+                   :default
+                   (recur (inc idx) depth)))))]
+        (if (= matching-paren-idx (- len 1))
+          (.Substring expr 1 (- len 2))
+          expr))
+      expr)))
+
 (defmacro cassignop [sym expr]
   (let [rec-sym (get-expr-record-sym sym)]
     `(do
@@ -669,7 +698,7 @@ Usage: (dispatch-hook #'hook-map)."
          (get-type [_])
          IExpression
          (expr-category [_])
-         (write [this#] (str "(" (write x#) " " ~expr " " (write y#) ")")))
+         (write [this#] (str "(" (write x#) " " ~expr " " (reduce-parens (write y#)) ")")))
        (cintrinsic
         ~sym
         [target# source#]
@@ -678,7 +707,30 @@ Usage: (dispatch-hook #'hook-map)."
                      (fn [x#] (new ~rec-sym target# x#)))
           (new ~rec-sym target# source#))))))
 
-(cbinops + - * / += -= *= /=)
+(defmacro c*op [sym]
+  (let [rec-sym (get-expr-record-sym sym)]
+    `(do
+       (defrecord ~rec-sym [~'args]
+         IExpression
+         (expr-category [_])
+         (write [_]
+           (if (= 1 (count ~'args))
+             (str ~(name sym) (write (first ~'args)))
+             (str "(" (str/join ~(str " " sym " ") (map write ~'args)) ")")))
+         IHasType
+         (get-type [_] (apply get-bin-op-type ~'args)))
+       (cintrinsic* '~sym
+                    (fn [& args#]
+                      (new ~rec-sym (doall (map cexpand args#))))))))
+
+(defmacro c*ops [& syms]
+  `(do ~@(for [x syms] `(c*op ~x))))
+
+(c*ops + - * /)
+(cassignop += "+=")
+(cassignop -= "-=")
+(cassignop *= "*=")
+(cassignop /= "/=")
 (compops < > <= >=)
 (compop* = "==")
 (compop* not= "!=")
@@ -807,14 +859,7 @@ Usage: (dispatch-hook #'hook-map)."
 
 (def ^:dynamic *indent* 0)
 
-(defn indent [] (str/join (for [x (range *indent*)] " ")))
-
-(defn reduce-parens [^String expr]
-  (when (nil? expr) (throw (ArgumentNullException. "expr")))
-  (comment (if (and (.StartsWith expr "(") (.EndsWith expr ")"))
-            (.Substring expr 1 (- (.Length expr) 2))
-            expr))
-  expr)
+(defn indent [] (str/join (for [x (range *indent*)] "\t")))
 
 (defrecord Statement [expr noindent]
   IExpression
@@ -828,9 +873,10 @@ Usage: (dispatch-hook #'hook-map)."
 
 (defn cstatement [expr & {:keys [noindent]}]
   (let [expr (cexpand expr)]
-    (if (or (is-block? expr) (= :statement (expr-category expr)))
-      expr
-      (Statement. (cexpand expr) noindent))))
+    (when expr
+      (if (or (is-block? expr) (= :statement (expr-category expr)))
+        expr
+        (Statement. (cexpand expr) noindent)))))
 
 (defn- wrap-statements [func statements]
   (conj (vec (drop-last statements))
@@ -845,7 +891,7 @@ Usage: (dispatch-hook #'hook-map)."
   (get-type [_] (get-type (last statements))))
 
 (defn cstatements [statements]
-  (Statements. (for [st statements] (cstatement st))))
+  (Statements. (doall (map cstatement (remove nil? statements)))))
 
 (defrecord CaseExpression [test cases]
   IHasType
@@ -924,9 +970,12 @@ Usage: (dispatch-hook #'hook-map)."
   IExpression
   (expr-category [_] :statement*)
   (write [_]
-    (str "if(" (reduce-parens (write expr)) ")\n"
-         (write then)
-         (when else "\n" "else " (write else))))
+    (str (indent)
+         "if(" (reduce-parens (write expr)) ")\n"
+         (binding [*indent* (inc *indent*)] (write then))
+         (when else
+           (str "\n" (indent) "else\n"
+                (binding [*indent* (inc *indent*)] (write else))))))
   (wrap-last [_ func]
     (IfExpression.
      expr
@@ -966,9 +1015,74 @@ Usage: (dispatch-hook #'hook-map)."
        "\n" (indent) "}")))
 
 (defn cblock [& statements]
-  (BlockExpression. (map cstatement statements)))
+  (BlockExpression. (doall (map cstatement (remove nil? statements)))))
 
 (cintrinsic* 'do cblock)
+
+(defrecord ForStatement [init-expr test-expr each-expr body]
+    IHasType
+    (get-type [_])
+    IExpression
+    (expr-category [_] :statement)
+    (write [_]
+      (str (indent) "for("
+           (reduce-parens (write init-expr)) "; "
+           (reduce-parens (write test-expr)) "; "
+           (reduce-parens (write each-expr)) ")\n"
+           (write body)))
+    (wrap-last [_ func] (throw (Exception. "Cannot take value of for statement"))))
+
+(defrecord CommaExpression [expressions]
+  IHasType
+  (get-type [_])
+  IExpression
+  (expr-category [_] :noreturn)
+  (write [_] (str/join ", " (map write expressions))))
+
+(defrecord NopExpression []
+  IHasType
+  (get-type [_])
+  IExpression
+  (write [_])
+  (expr-category [_]))
+
+(defn- wrap-for-expressions [form]
+  (cond
+   (empty? form)
+   (NopExpression.)
+   (vector? form)
+   (CommaExpression. (map cexpand form))
+   :default
+   (cexpand form)))
+
+(cintrinsic* 'for
+             (fn [init test each & body]
+               (let [body (if (= (count body) 1)
+                            (cstatement (first body))
+                            (apply cblock body))]
+                 (ForStatement.
+                  (wrap-for-expressions init)
+                  (wrap-for-expressions test)
+                  (wrap-for-expressions each)
+                  body))))
+
+(defrecord BreakStatement []
+  IHasType
+  (get-type [_])
+  IExpression
+  (write [_] "break")
+  (expr-category [_]))
+
+(cintrinsic break [] (BreakStatement.))
+
+(defrecord ContinueStatement []
+  IHasType
+  (get-type [_])
+  IExpression
+  (write [_] "continue")
+  (expr-category [_]))
+
+(cintrinsic continue [] (ContinueStatement.))
 
 (defn- add-local [decl]
   (let [var-name (name decl)]
@@ -980,32 +1094,29 @@ Usage: (dispatch-hook #'hook-map)."
 
 (cintrinsic*
  'let
- (fn [& [forms]]
-   (assert (even? (count forms)) "let expression must contain an even number of forms")
-   (apply
-    cblock
-    (for [[decl expr-form] (partition 2 forms)]
-      (let [init-expr (cexpand expr-form)
-            explicit-tag (:tag (meta decl))
-            decl-type (if explicit-tag
-                        explicit-tag
-                        (get-type init-expr))]
-        (assert decl-type (str "unable to infer type for let binding: " decl " " expr-form))
-        (let [decl-type (lookup-type decl-type)
-              decl-expr (create-var-decl
-                         (name decl)
-                         decl-type)]
-          (add-local decl-expr)
-          (if (is-block? init-expr)
-            (wrap-last init-expr (fn [x] (set_BANG_Expression. (VariableRefExpression. decl-expr) x)))
-            (set_BANG_Expression. (VariableRefExpression. decl-expr) init-expr))))))))
-
-(defrecord NopExpression []
-  IHasType
-  (get-type [_])
-  IExpression
-  (write [_])
-  (expr-category [_]))
+ (fn [& forms]
+   (let [let-forms (first forms)
+         body-forms (rest forms)]
+     (assert (even? (count let-forms)) "let expression must contain an even number of forms")
+     (apply
+      cblock
+      (concat
+       (for [[decl expr-form] (partition 2 let-forms)]
+         (let [init-expr (cexpand expr-form)
+               explicit-tag (:tag (meta decl))
+               decl-type (if explicit-tag
+                           explicit-tag
+                           (get-type init-expr))]
+           (assert decl-type (str "unable to infer type for let binding: " decl " " expr-form))
+           (let [decl-type (lookup-type decl-type)
+                 decl-expr (create-var-decl
+                            (name decl)
+                            decl-type)]
+             (add-local decl-expr)
+             (if (is-block? init-expr)
+               (wrap-last init-expr (fn [x] (set_BANG_Expression. (VariableRefExpression. decl-expr) x)))
+               (set_BANG_Expression. (VariableRefExpression. decl-expr) init-expr)))))
+       (map cstatement body-forms))))))
 
 (cintrinsic*
  'declare
@@ -1016,7 +1127,7 @@ Usage: (dispatch-hook #'hook-map)."
         (create-var-decl
          sym-name
          decl-type))
-       (NopExpression.))
+       nil)
      (throw (ArgumentException.
              (str "Unable to infer type for declare expression of symbol" sym))))))
 
@@ -1068,7 +1179,7 @@ Usage: (dispatch-hook #'hook-map)."
     (str "typedef struct " struct-name " {\n"
        (str/join
         (for [[field-name field] fields]
-          (str " "
+          (str "\t"
                (write-decl-expr (get-type field)
                                 (name field))
                (when-let [bits (get-bitfield-width field)]
@@ -1119,8 +1230,8 @@ Usage: (dispatch-hook #'hook-map)."
         (binding [*locals* (into {} (for [param params] [(name param) param]))
                   *local-decls* []]
           (let [body-forms (or body-forms [(ReturnExpression. nil)])
-                body-statements (vec (map cstatement body-forms)) 
-                local-decls (vec (map cstatement *local-decls*))
+                body-statements (vec (remove nil? (doall (map cstatement body-forms)))) 
+                local-decls (vec (doall (map cstatement *local-decls*)))
                 body-statements (concat local-decls body-statements)
                 body-block (if (and (= 1 (count body-statements))
                                     (= :block (expr-category (first body-statements))))
@@ -1204,7 +1315,11 @@ Usage: (dispatch-hook #'hook-map)."
   (apply cdefn* forms))
 
 (defmacro cdefn- [& forms]
-  `(c-in-clj.core/cdefn ^:private ~@forms))
+  (let [[sym & forms] forms
+        metadata (meta sym)
+        metadata (assoc metadata :private true)
+        sym (with-meta sym metadata)]
+    `(c-in-clj.core/cdefn ~sym ~@forms)))
 
 (defmacro cdefns [])
 

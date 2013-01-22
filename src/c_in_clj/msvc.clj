@@ -70,7 +70,7 @@
     (if (is-function-type? decl-type)
       (let [{:keys [params]} decl-type
             clr-params (get-clr-params params)
-            args-size (reduce + (map #(min (get-clr-type-size %) 4) clr-params))]
+            args-size (reduce + (map #(max (get-clr-type-size %) 4) clr-params))]
         (str "_" (name decl) "@" args-size)))))
 
 (defn- get-dg-type [ret-type param-types]
