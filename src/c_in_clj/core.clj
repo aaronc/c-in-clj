@@ -246,6 +246,8 @@ Usage: (dispatch-hook #'hook-map)."
 
 (def ^:private type-aliases (atom {}))
 
+(def ^:private symbol-aliases (atom {}))
+
 (def ^:private save-id (atom 0))
 
 (def ^:private ^:dynamic *dynamic-compile-header* nil)
@@ -554,22 +556,30 @@ Usage: (dispatch-hook #'hook-map)."
 
 (def ^:private cintrinsics (atom {}))
 
+(defmacro csymbol-alias [symbol-alias symbol-name]
+  `(swap! symbol-aliases
+          assoc
+          '~symbol-alias
+          '~symbol-name))
+
 (defn cexpand-op-sym [sym args]
   (let [sym-name (name sym)]
-    (if-let [intrinsic (@cintrinsics sym)]
-      (apply intrinsic args)
-      (if (.StartsWith sym-name ".") ;; Member access
-        (cexpand-op-sym '. (apply vector
-                                  (first args)
-                                  (.Substring sym-name 1)
-                                  (rest args)))
-        (if-let [macro (lookup-macro sym)]
-          (cexpand (apply macro args))
-          (if-let [local-func (get *locals* sym)]
-            (AnonymousFunctionCallExpression. (name sym) (map cexpand args))
-            (if (lookup-symbol sym)
-              (FunctionCallExpression. sym (map cexpand args))
-              (throw (ArgumentException. (str "Don't know how to handle list symbol " sym))))))))))
+    (if-let [alias (@symbol-aliases sym-name)]
+      (cexpand-op-sym alias)
+      (if-let [intrinsic (@cintrinsics sym)]
+        (apply intrinsic args)
+        (if (.StartsWith sym-name ".") ;; Member access
+          (cexpand-op-sym '. (apply vector
+                                    (first args)
+                                    (.Substring sym-name 1)
+                                    (rest args)))
+          (if-let [macro (lookup-macro sym)]
+            (cexpand (apply macro args))
+            (if-let [local-func (get *locals* sym)]
+              (AnonymousFunctionCallExpression. (name sym) (map cexpand args))
+              (if (lookup-symbol sym)
+                (FunctionCallExpression. sym (map cexpand args))
+                (throw (ArgumentException. (str "Don't know how to handle list symbol " sym)))))))))))
 
 (defn cexpand-list [[op & args]]
   (cond
@@ -778,10 +788,17 @@ Usage: (dispatch-hook #'hook-map)."
      IHasType
      (get-type [_] 'bool))
 
-(cop sizeof [x]
-     (write [_] (write-str "sizeof(" x ")"))
-     IHasType
-     (get-type [_] 'size_t))
+(defrecord SizeofExpression [x]
+  IExpression
+  (expr-category [_])
+  (write [_] (let [type (lookup-type x)]
+               (str "sizeof(" (write-type type) ")")))
+  IHasType
+  (get-type [_] (lookup-type 'size_t)))
+
+(cintrinsic*
+ 'sizeof (fn [x]
+           (SizeofExpression. x)))
 
 ;; (defn c* [& args]
 ;;   (let [expanded (for [arg args]
@@ -860,6 +877,23 @@ Usage: (dispatch-hook #'hook-map)."
      (write [_] (write-str "*" x))
      IHasType
      (get-type [_]))
+
+(csymbol-alias 'clojure.core/deref deref)
+
+(defrecord CVerbatim [args]
+  IHasType
+  (get-type [_])
+  IExpression
+  (expr-category [_])
+  (write [_]
+    (apply write-str args)))
+
+(cintrinsic* 'c*
+            (fn [& args]
+              (CVerbatim.
+               (map (fn [x]
+                      (if (string? x) x (cexpand x)))
+                    args))))
 
 (def ^:dynamic *indent* 0)
 
@@ -1269,6 +1303,14 @@ Usage: (dispatch-hook #'hook-map)."
 ;;                (write-decl decl))))
 ;;   *dynamic-compile-header*)
 
+(defrecord IncludeDeclaration [package include-name]
+  clojure.lang.Named
+  (getName [_] include-name)
+  IDeclaration
+  (decl-package [_] package)
+  (write-decl [_] (str "#include <" include-name ">"))
+  (write-impl [_]))
+
 (defn- output-dev-src [package decls cpp-mode preamble temp-output-path]
   (binding [*dynamic-compile* true
             *dynamic-compile-header* ""
@@ -1277,7 +1319,8 @@ Usage: (dispatch-hook #'hook-map)."
                                         (remove
                                          nil?
                                          (for [decl @(:declarations package)]
-                                           (when-not (name decl)
+                                           (when (or (not (name decl))
+                                                     (instance? IncludeDeclaration decl))
                                              (write-decl decl))))))
           ;;referenced (apply set/union (map :referenced-decls decls))
           body (str/join "\n\n" (doall (map write-impl decls)))
@@ -1361,7 +1404,9 @@ Usage: (dispatch-hook #'hook-map)."
     (common-denominator-type target-type other-type))
   (get-fields [_] (get-fields target-type))
   (create-field-access-expr [_ instance-expr field-name]
-    (create-field-access-expr target-type instance-expr field-name)))
+    (create-field-access-expr target-type instance-expr field-name))
+  (create-explicit-cast-expr [this expr]
+    (DefaultCastExpression. this expr)))
 
 (defn ctypedef* [target-type typedef-name metadata]
   (let [package (get-package)
@@ -1446,14 +1491,6 @@ Usage: (dispatch-hook #'hook-map)."
   IDeclaration
   (decl-package [_] package)
   (write-decl [_] (str "#include \"" (name referenced-package) ".h\""))
-  (write-impl [_]))
-
-(defrecord IncludeDeclaration [package include-name]
-  clojure.lang.Named
-  (getName [_] include-name)
-  IDeclaration
-  (decl-package [_] package)
-  (write-decl [_] (str "#include <" include-name ">"))
   (write-impl [_]))
 
 (defn cinclude [package-or-include & {:as opts}]
