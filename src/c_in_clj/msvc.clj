@@ -41,21 +41,22 @@
 (defrecord CompiledSymbolRef [symbol-name fn-ptr-ptr cur-decl cur-fn-ptr cur-dll-info invoker])
 
 (defn get-clr-type [ctype]
-  (let [type-name (name ctype)]
-    (case type-name
-      "int8_t" SByte
-      "int16_t" Int16
-      "int32_t" Int32
-      "int64_t" Int64
-      "uint8_t" Byte
-      "uint16_t" UInt16
-      "uint32_t" UInt32
-      "uint64_t" UInt64
-      "bool" Boolean
-      "size_t" UIntPtr
-      "char*" String
-      (when (is-reference-type? ctype)
-        IntPtr))))
+  (let [ctype (lookup-type ctype)]
+    (let [type-name (name ctype)]
+      (case type-name
+        "int8_t" SByte
+        "int16_t" Int16
+        "int32_t" Int32
+        "int64_t" Int64
+        "uint8_t" Byte
+        "uint16_t" UInt16
+        "uint32_t" UInt32
+        "uint64_t" UInt64
+        "bool" Boolean
+        "size_t" UIntPtr
+        "char*" String
+        (when (is-reference-type? ctype)
+          IntPtr)))))
 
 (defn get-clr-params [params]
   (map (comp get-clr-type get-type) params))
@@ -162,14 +163,9 @@
  [{:keys [compiled-symbols]} decl]
  (when *dynamic-compile*
    (let [sym-name (name decl)
-   ;;      {:keys [fn-ptr-ptr cur-decl]} (get @compiled-symbols sym-name)
-   ;;      fn-type (get-type @cur-decl)
-         ;(str "(*(" cret "(**)(" param-sig "))" fn-ptr-ptr ")")
-         ;fn-def (str "#define " fn-name " " fn-const "\n")
-         ]
-     ;; (println fn-type)
-     (println sym-name)
-     )))
+         {:keys [fn-ptr-ptr]} (get @compiled-symbols sym-name)
+         fn-type (get-type decl)]
+     (str "#define " sym-name " (*(" (write-decl-expr fn-type "" 2) ")" fn-ptr-ptr ")"))))
 
 (defn- msvc-write-hook [ctxt hook-name expr]
   (dispatch-hook #'msvc-hook hook-name ctxt expr))
@@ -182,7 +178,10 @@
     (msvc-compile-decls this decls compile-source))
   ITypeScope
   (resolve-type [_ type-name]
-    (throw (Exception. (str "Unable to resolve type " type-name)))))
+    (throw (Exception. (str "Unable to resolve type " type-name))))
+  ISymbolScope
+  (resolve-symbol [_ sym-name]
+    (throw (Exception. (str "Unable to resolve symbol " sym-name)))))
 
 (defn- init-cl-bat [temp-output-path msvc-path]
   (let [cl-bat-path (Path/Combine temp-output-path "cl.bat")
@@ -232,7 +231,7 @@
 
 (cpackage TestMsvcModule test_msvc1)
 
-(cdefn ^i32 t1 [^i32 x] (+ x 1))
+(cdefn ^i32 t1 [^i32 x] (+ x 7))
 
 (cdefn ^char* t2 [] "Hello World!")
 
@@ -247,5 +246,5 @@
 ;;        (declare ^T1 x)
 ;;        (set! (. x a) 5))
 
-;; (cdefn ^i32 t5 []
-;;        (t1 3))
+(cdefn ^i32 t5 []
+        (t1 3))
