@@ -958,13 +958,15 @@ Usage: (dispatch-hook #'hook-map)."
  'case
  (fn [test & args]
    (let [test (cexpand test)
-         cases (partition-all 2 args)
+         cases (partition 2 args)
+         has-default (odd? (count args))
          cases
          (for [[expr block] cases]
-           (if block
-             [(cexpand expr)
-              (cstatement block)]
-             [(cstatement expr)]))]
+           [(cexpand expr)
+            (cstatement block)])
+         cases (if has-default
+                 (conj cases [(cstatement (last args))])
+                 cases)]
      (CaseExpression. test cases))))
 
 (defrecord ReturnExpression [expr]
