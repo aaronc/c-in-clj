@@ -961,9 +961,10 @@ Usage: (dispatch-hook #'hook-map)."
          cases (partition 2 args)
          has-default (odd? (count args))
          cases
-         (for [[expr block] cases]
-           [(cexpand expr)
-            (cstatement block)])
+         (vec
+          (for [[expr block] cases]
+            [(cexpand expr)
+             (cstatement block)]))
          cases (if has-default
                  (conj cases [(cstatement (last args))])
                  cases)]
