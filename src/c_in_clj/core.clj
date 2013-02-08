@@ -371,7 +371,7 @@ Usage: (dispatch-hook #'hook-map)."
          (keyword? type-name) (AnonymousType. (name type-name))
          :default
          (let [type-name (name type-name)]
-           (if-let [[_ type-name array-len] (re-matches #"(.*)!([0-9])*" type-name)]
+           (if-let [[_ type-name array-len] (re-matches #"(.*)!([0-9]*)" type-name)]
              (let [underlying-type (lookup-type type-name)
                    array-len (when-not (empty? array-len)
                                (int array-len))]
@@ -975,11 +975,12 @@ Usage: (dispatch-hook #'hook-map)."
   (get-type [_] (get-type expr))
   IExpression
   (expr-category [_])
-  (write [_] (if expr
-               (if-let [expr (write expr)]
-                 (str "return " (reduce-parens expr))
-                 "return")
-               "return")))
+  (write [_]
+    (if expr
+      (if-let [expr (write expr)]
+        (str "return " (reduce-parens expr))
+        "return")
+      "return")))
 
 (cintrinsic*
  'return
@@ -1106,6 +1107,26 @@ Usage: (dispatch-hook #'hook-map)."
                   (wrap-for-expressions test)
                   (wrap-for-expressions each)
                   body))))
+
+(defrecord WhileStatement [test-expr body]
+    IHasType
+    (get-type [_])
+    IExpression
+    (expr-category [_] :statement)
+    (write [_]
+      (str (indent) "while(" (reduce-parens (write test-expr)) ")\n"
+           (write body)))
+    (wrap-last [_ func] (throw (Exception. "Cannot take value of while statement"))))
+
+(cintrinsic* 'while
+             (fn [test & body]
+               (let [body (if (= (count body) 1)
+                            (cstatement (first body))
+                            (apply cblock body))]
+                 (WhileStatement.
+                  (cexpand test)
+                  body))))
+
 
 (defrecord BreakStatement []
   IHasType
@@ -1432,14 +1453,18 @@ Usage: (dispatch-hook #'hook-map)."
         func-ptr-type (PointerType. (FunctionType. return-type params))]
     (ctypedef* func-ptr-type typedef-name metadata)))
 
-(defrecord EnumValue [name value base-type]
+(defrecord EnumValue [name value base-type enum-type-name]
   clojure.lang.Named
-  (getName [_] name)
+  (getName [_]
+    (lookup-type enum-type-name)
+    name)
   IHasType
   (get-type [_] base-type)
   IExpression
   (expr-category [_])
-  (write [_] name))
+  (write [_]
+    (lookup-type enum-type-name)
+    name))
 
 (defrecord EnumType [package enum-name values]
   clojure.lang.Named
@@ -1477,7 +1502,8 @@ Usage: (dispatch-hook #'hook-map)."
         base-type (lookup-type "i32")
         values (map #(EnumValue. (name (first %))
                                  (second %)
-                                 base-type)
+                                 base-type
+                                 enum-name)
                     values)
         enum (EnumType. package enum-name values)]
     (add-type package enum)
