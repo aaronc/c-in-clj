@@ -67,12 +67,13 @@
     (Marshal/SizeOf (let [^Type t t] t))))
 
 (defn- get-proc-name [decl]
-  (let [decl-type (get-type decl)]
-    (if (is-function-type? decl-type)
-      (let [{:keys [params]} decl-type
-            clr-params (get-clr-params params)
+  (if-let [{:keys [params]} (:function-type decl)]
+    (if (and (not (empty? params)) (= (name (last params)) "..."))
+      (name decl)
+      (let [clr-params (get-clr-params params)
             args-size (reduce + (map #(max (get-clr-type-size %) 4) clr-params))]
-        (str "_" (name decl) "@" args-size)))))
+        (str "_" (name decl) "@" args-size)))
+    (name decl)))
 
 (defn- get-dg-type [ret-type param-types]
   (let [dg-sig (into [ret-type] param-types)]
@@ -83,7 +84,7 @@
 
 (defn- make-invoker [fn-ptr decl]
   (let [decl-type (get-type decl)]
-    (if (is-function-type? decl-type)
+    (if (:function-type decl)
       (let [{:keys [params return-type]} decl-type
             clr-ret (get-clr-type return-type)
             clr-params (map (comp get-clr-type get-type) params)
@@ -91,7 +92,8 @@
             dg (Marshal/GetDelegateForFunctionPointer fn-ptr dg-type)
             invoke-method (.GetMethod dg-type "Invoke")]
         (fn [& args]
-          (.Invoke invoke-method dg (to-array args)))))))
+          (.Invoke invoke-method dg (to-array args))))
+      fn-ptr)))
 
 (defn- msvc-compile-decls [{:keys [temp-output-path cl-args cl-bat-path compiled-symbols dll-handles] :as ctxt} decls {:keys [source filename]}]
   (when (run-cl temp-output-path
@@ -159,6 +161,11 @@
  (str (when cpp-mode "extern \"C\" ") "__declspec(dllexport) "))
 
 (msvc-hook
+ :before-global-variable-declaration
+ [{:keys [cpp-mode]} expr]
+ (str (when cpp-mode "extern \"C\" ") "__declspec(dllexport) "))
+
+(msvc-hook
  :alternate-function-declaration
  [{:keys [compiled-symbols]} decl]
  (when *dynamic-compile*
@@ -166,6 +173,15 @@
          {:keys [fn-ptr-ptr]} (get @compiled-symbols sym-name)
          fn-type (get-type decl)]
      (str "#define " sym-name " (*(" (write-decl-expr fn-type "" 2) ")" fn-ptr-ptr ")"))))
+
+(msvc-hook
+ :alternate-global-variable-declaration
+ [{:keys [compiled-symbols]} decl]
+ (when *dynamic-compile*
+   (let [sym-name (name decl)
+         {:keys [fn-ptr-ptr]} (get @compiled-symbols sym-name)
+         fn-type (get-type decl)]
+     (str "#define " sym-name " (**(" (write-decl-expr fn-type "" 2) ")" fn-ptr-ptr ")"))))
 
 (defn- msvc-write-hook [ctxt hook-name expr]
   (dispatch-hook #'msvc-hook hook-name ctxt expr))

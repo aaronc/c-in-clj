@@ -253,7 +253,7 @@ Usage: (dispatch-hook #'hook-map)."
 (def ^:private ^:dynamic *dynamic-compile-header* nil)
 
 (defn add-referenced-decl [resolved]
-  ;; (println "trying to add ref to" resolved
+  ;; (println "trying to add ref to" (name resolved)
   ;;          (satisfies? IDeclaration resolved)
   ;;          *referenced-decls*)
   (when (and (satisfies? IDeclaration resolved) *referenced-decls*)
@@ -349,6 +349,7 @@ Usage: (dispatch-hook #'hook-map)."
   IType
   (write-type [_] type-name)
   (write-decl-expr [_ var-name] (str type-name " " var-name))
+  (write-decl-expr [_ var-name pointer-depth] (str type-name (apply str (repeat pointer-depth "*")) " " var-name))
   (is-reference-type? [_])
   (is-function-type? [_]))
 
@@ -424,7 +425,7 @@ Usage: (dispatch-hook #'hook-map)."
   (get-type [_] param-type)
   IExpression
   (expr-category [_] :local)
-  (write [_] (write-decl-expr param-type param-name)))
+  (write [_] (write-decl-expr (lookup-type param-type) param-name)))
 
 (defn- write-function-type [{:keys [return-type params]}
                             pointer-depth name?]
@@ -506,14 +507,13 @@ Usage: (dispatch-hook #'hook-map)."
   clojure.lang.Named
   (getName [_] var-name)
   IHasType
-  (get-type [_] var-type)
+  (get-type [_] (lookup-type var-type))
   IExpression
   (expr-category [_])
-  (write [_] (write-decl-expr var-type var-name)))
+  (write [_] (write-decl-expr (lookup-type var-type) var-name)))
 
 (defn create-var-decl [var-name var-type]
-  (let [var-type (lookup-type var-type)]
-    (VariableDeclaration. var-name var-type)))
+  (VariableDeclaration. var-name var-type))
 
 (defrecord VariableRefExpression [variable]
   IExpression
@@ -1180,10 +1180,14 @@ Usage: (dispatch-hook #'hook-map)."
                (set_BANG_Expression. (VariableRefExpression. decl-expr) init-expr)))))
        (map cstatement body-forms))))))
 
+(defn- get-var-type-tag [metadata]
+  (let [tag (:tag metadata)]
+    (if (string? tag) (keyword tag) tag)))
+
 (cintrinsic*
  'declare
  (fn [sym]
-   (if-let [decl-type (:tag (meta sym))]
+   (if-let [decl-type (get-var-type-tag (meta sym))]
      (let [sym-name (name sym)]
        (add-local
         (create-var-decl
@@ -1275,12 +1279,23 @@ Usage: (dispatch-hook #'hook-map)."
          expr (cexpand expr)]
      (create-explicit-cast-expr target-type expr))))
 
+(defrecord VarArgsType []
+  clojure.lang.Named
+  (getName [_] "...")
+  IType
+  (write-type [_])
+  (write-decl-expr [_ var-name] "...")
+  (is-reference-type? [_])
+  (is-function-type? [_]))
+
 (defn- parse-fn-params [params]
   (for [param params]
     (let [metadata (meta param)
-          param-name (name param)
-          param-type (lookup-type (:tag metadata))]
-      (FunctionParameter. param-name param-type metadata nil))))
+          param-name (name param)]
+      (if (= param-name "...")
+        (FunctionParameter. param-name (VarArgsType.) metadata nil)
+        (let [param-type (get-var-type-tag metadata)]
+          (FunctionParameter. param-name param-type metadata nil))))))
 
 (defn parse-cfn [package [func-name & forms]]
   (let [f1 (first forms)
@@ -1292,7 +1307,7 @@ Usage: (dispatch-hook #'hook-map)."
         (binding [*locals* (into {} (for [param params] [(name param) param]))
                   *local-decls* []]
           (let [func-metadata (meta func-name)
-                ret-type (:tag func-metadata)
+                ret-type (get-var-type-tag func-metadata)
                 has-return (not (= "void" (name ret-type)))
                 body-forms (or body-forms (when has-return [(ReturnExpression. nil)]))
                 body-statements (vec (remove nil? (doall (map cstatement body-forms)))) 
@@ -1364,19 +1379,22 @@ Usage: (dispatch-hook #'hook-map)."
      (map-indexed
       (fn [i line] (println (str i "  " line))) lines))))
 
-(defn compile-cfns [funcs]
+(defn do-compile-decls [decls parse-fn]
   (let [{:keys [module] :as package} (get-package)]
     (if (dev-mode? module)
       (let [{:keys [compile-ctxt temp-output-path preamble cpp-mode]} module
-            func-decls (doall (for [func funcs] (parse-cfn package func)))
+            decls (doall (map parse-fn decls))
             {:keys [body-source] :as src}
-            (output-dev-src package func-decls cpp-mode preamble temp-output-path)]
-        (when-let [compiled (compile-decls compile-ctxt func-decls src)]
+            (output-dev-src package decls cpp-mode preamble temp-output-path)]
+        (when-let [compiled (compile-decls compile-ctxt decls src)]
           (println body-source)
           (doseq [[n v] compiled] (intern *ns* (symbol (name n)) v))))
       (let [{:keys [loader]} module]
-        (doseq [[func-name & forms] funcs]
-          (load-symbol loader (:name package) func-name))))))
+        (doseq [[decl-name & forms] decls]
+          (load-symbol loader (:name package) decl-name))))))
+
+(defn compile-cfns [funcs]
+  (do-compile-decls funcs #(parse-cfn (get-package) %)))
 
 (defn cdefn* [& forms]
   (compile-cfns [forms]))
@@ -1391,7 +1409,7 @@ Usage: (dispatch-hook #'hook-map)."
         sym (with-meta sym metadata)]
     `(c-in-clj.core/cdefn ~sym ~@forms)))
 
-(defmacro cdefns [])
+;;(defmacro cdefns [])
 
 (defn unqualify-symbols [form]
   (if (seq? form)
@@ -1541,21 +1559,24 @@ Usage: (dispatch-hook #'hook-map)."
   IHasType
   (get-type [_] var-type)
   IDeclaration
-  (write-decl [_] (str "extern " (write-decl-expr var-type var-name) ";"))
-  (write-impl [_] (str (write-decl-expr var-type var-name) (when init-expr (str " = " (write init-expr))) ";")))
+  (write-decl [this]
+    (or (apply-hook :alternate-global-variable-declaration this)
+        (str (or (apply-hook :before-global-variable-declaration this) "extern ") (write-decl-expr var-type var-name) ";")))
+  (write-impl [this] (str (apply-hook :before-global-variable-declaration this) (write-decl-expr var-type var-name) (when init-expr (str " = " (write init-expr))) ";")))
 
-(defn cdef*
-  ([var-name init-expr]
-     (let [package (get-package)
-           metadata (meta var-name)
-           var-name (name var-name)
-           var-type (lookup-type (:tag metadata))
-           init-expr (when init-expr (cexpand init-expr))
-           var-decl (GlobalVariableDeclaration. package var-name var-type
-                                                init-expr metadata nil)]
-       (add-symbol package var-decl)
-       (println (write-impl var-decl))))
-  ([var-name] (cdef* var-name nil)))
+(defn- parse-cdef [[var-name init-expr]]
+  (let [package (get-package)
+        metadata (meta var-name)
+        var-name (name var-name)
+        tag (if (string? tag) (keyword tag) tag)
+        var-type (lookup-type (:tag metadata))
+        init-expr (when init-expr (cexpand init-expr))
+        var-decl (GlobalVariableDeclaration. package var-name var-type init-expr metadata nil)]
+    (add-symbol package var-decl)
+    var-decl))
+
+(defn cdef* [& forms]
+  (do-compile-decls [forms] parse-cdef))
 
 (defn write-package-source [{:keys [declarations module] :as package} & {:keys [src-output-path cpp-mode]}]
   (let [{:keys [preamble]} module
