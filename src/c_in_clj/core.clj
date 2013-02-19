@@ -422,7 +422,7 @@ Usage: (dispatch-hook #'hook-map)."
   clojure.lang.Named
   (getName [_] param-name)
   IHasType
-  (get-type [_] param-type)
+  (get-type [_] (lookup-type param-type))
   IExpression
   (expr-category [_] :local)
   (write [_] (write-decl-expr (lookup-type param-type) param-name)))
@@ -737,6 +737,20 @@ Usage: (dispatch-hook #'hook-map)."
                     (fn [& args#]
                       (new ~rec-sym (doall (map cexpand args#))))))))
 
+(defmacro comp*op* [sym expr]
+  (let [rec-sym (get-expr-record-sym sym)]
+    `(do
+       (defrecord ~rec-sym [~'args]
+         IExpression
+         (expr-category [_])
+         (write [_]
+           (str "(" (str/join ~(str " " expr " ") (map write ~'args)) ")"))
+         IHasType
+         (get-type [_] (lookup-type 'bool)))
+       (cintrinsic* '~sym
+                    (fn [& args#]
+                      (new ~rec-sym (doall (map cexpand args#))))))))
+
 (defmacro c*ops [& syms]
   `(do ~@(for [x syms] `(c*op ~x))))
 
@@ -750,8 +764,8 @@ Usage: (dispatch-hook #'hook-map)."
 (compop* not= "!=")
 (cbinop* mod "%")
 (cassignop mod= "%=")
-(compop* or "||")
-(compop* and "&&")
+(comp*op* or "||")
+(comp*op* and "&&")
 (cbinop* bit-or "|")
 (cassignop bit-or= "|=")
 (cbinop* bit-and "&")
@@ -784,9 +798,9 @@ Usage: (dispatch-hook #'hook-map)."
 (cunop post-dec [x] (write-str x "--"))
 
 (cop not [x]
-     (write [_] (write-str "!" write x))
+     (write [_] (str "!" (write x)))
      IHasType
-     (get-type [_] 'bool))
+     (get-type [_] (lookup-type 'bool)))
 
 (defrecord SizeofExpression [x]
   IExpression
@@ -834,7 +848,7 @@ Usage: (dispatch-hook #'hook-map)."
                (let [instance-expr (cexpand instance-expr)
                      instance-type (get-type instance-expr)
                      access-expr (create-field-access-expr
-                    instance-type instance-expr member-name)]
+                                  instance-type instance-expr member-name)]
                  (if args
                    (let [args (map cexpand args)]
                      )
@@ -1071,7 +1085,8 @@ Usage: (dispatch-hook #'hook-map)."
            (reduce-parens (write init-expr)) "; "
            (reduce-parens (write test-expr)) "; "
            (reduce-parens (write each-expr)) ")\n"
-           (write body)))
+           (binding [*indent* (inc *indent*)]
+             (write body))))
     (wrap-last [_ func] (throw (Exception. "Cannot take value of for statement"))))
 
 (defrecord CommaExpression [expressions]
@@ -1115,7 +1130,7 @@ Usage: (dispatch-hook #'hook-map)."
     (expr-category [_] :statement)
     (write [_]
       (str (indent) "while(" (reduce-parens (write test-expr)) ")\n"
-           (write body)))
+           (binding [*indent* (inc *indent*)] (write body))))
     (wrap-last [_ func] (throw (Exception. "Cannot take value of while statement"))))
 
 (cintrinsic* 'while
@@ -1568,8 +1583,8 @@ Usage: (dispatch-hook #'hook-map)."
   (let [package (get-package)
         metadata (meta var-name)
         var-name (name var-name)
-        tag (if (string? tag) (keyword tag) tag)
-        var-type (lookup-type (:tag metadata))
+        tag (get-var-type-tag metadata)
+        var-type (lookup-type tag)
         init-expr (when init-expr (cexpand init-expr))
         var-decl (GlobalVariableDeclaration. package var-name var-type init-expr metadata nil)]
     (add-symbol package var-decl)

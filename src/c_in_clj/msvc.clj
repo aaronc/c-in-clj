@@ -55,6 +55,7 @@
         "bool" Boolean
         "size_t" UIntPtr
         "char" Char
+        "..." IntPtr
         (when (is-reference-type? ctype)
           IntPtr)))))
 
