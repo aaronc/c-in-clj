@@ -501,19 +501,23 @@ Usage: (dispatch-hook #'hook-map)."
          "(" (str/join "," (map write args)) ")"))
   (expr-category [_])
   IHasType
-  (get-type [this]))
+  (get-type [this] (get-type func-expr)))
 
-(defrecord VariableDeclaration [var-name var-type]
+(defrecord VariableDeclaration [var-name var-type init-expr]
   clojure.lang.Named
   (getName [_] var-name)
   IHasType
   (get-type [_] (lookup-type var-type))
   IExpression
   (expr-category [_])
-  (write [_] (write-decl-expr (lookup-type var-type) var-name)))
+  (write [_]
+    (str (write-decl-expr (lookup-type var-type) var-name)
+         (when init-expr (str " = " (write init-expr))))))
 
-(defn create-var-decl [var-name var-type]
-  (VariableDeclaration. var-name var-type))
+(defn create-var-decl
+  ([var-name var-type] (create-var-decl var-name var-type nil))
+  ([var-name var-type init-expr]
+      (VariableDeclaration. var-name var-type init-expr)))
 
 (defrecord VariableRefExpression [variable]
   IExpression
@@ -851,7 +855,7 @@ Usage: (dispatch-hook #'hook-map)."
                                   instance-type instance-expr member-name)]
                  (if args
                    (let [args (map cexpand args)]
-                     )
+                     (ComputedFunctionCallExpression. access-expr args))
                    access-expr))))
 
 (cintrinsic* '->
@@ -938,7 +942,9 @@ Usage: (dispatch-hook #'hook-map)."
   IExpression
   (expr-category [_] :statement*)
   (write [_] (str/join "\n" (map write statements)))
-  (wrap-last [_ func] (wrap-statements func statements))
+  (wrap-last [_ func]
+    (Statements.
+     (wrap-statements func statements)))
   IHasType
   (get-type [_] (get-type (last statements))))
 
@@ -1020,6 +1026,8 @@ Usage: (dispatch-hook #'hook-map)."
 ;;                       ;;              (cstatement (first statements)))
 ;;                       :default (cblock statements))))
 
+(declare cblock)
+
 (defrecord IfExpression [expr then else]
   IHasType
   (get-type [_])
@@ -1028,10 +1036,10 @@ Usage: (dispatch-hook #'hook-map)."
   (write [_]
     (str (indent)
          "if(" (reduce-parens (write expr)) ")\n"
-         (binding [*indent* (inc *indent*)] (write then))
+         (write then)
          (when else
            (str "\n" (indent) "else\n"
-                (binding [*indent* (inc *indent*)] (write else))))))
+                (write else)))))
   (wrap-last [_ func]
     (IfExpression.
      expr
@@ -1042,12 +1050,12 @@ Usage: (dispatch-hook #'hook-map)."
              (fn
                ([expr then]
                   (IfExpression. (cexpand expr)
-                                 (cstatement then)
+                                 (cblock then)
                                  nil))
               ([expr then else]
                  (IfExpression. (cexpand expr)
-                                (cstatement then)
-                                (cstatement else)))))
+                                (cblock then)
+                                (cblock else)))))
 
 (defrecord DeclExpression [var-type var-name init-expr]
   IHasType
@@ -1085,8 +1093,7 @@ Usage: (dispatch-hook #'hook-map)."
            (reduce-parens (write init-expr)) "; "
            (reduce-parens (write test-expr)) "; "
            (reduce-parens (write each-expr)) ")\n"
-           (binding [*indent* (inc *indent*)]
-             (write body))))
+           (write body)))
     (wrap-last [_ func] (throw (Exception. "Cannot take value of for statement"))))
 
 (defrecord CommaExpression [expressions]
@@ -1114,9 +1121,7 @@ Usage: (dispatch-hook #'hook-map)."
 
 (cintrinsic* 'for
              (fn [init test each & body]
-               (let [body (if (= (count body) 1)
-                            (cstatement (first body))
-                            (apply cblock body))]
+               (let [body (apply cblock body)]
                  (ForStatement.
                   (wrap-for-expressions init)
                   (wrap-for-expressions test)
@@ -1130,14 +1135,12 @@ Usage: (dispatch-hook #'hook-map)."
     (expr-category [_] :statement)
     (write [_]
       (str (indent) "while(" (reduce-parens (write test-expr)) ")\n"
-           (binding [*indent* (inc *indent*)] (write body))))
+           (write body)))
     (wrap-last [_ func] (throw (Exception. "Cannot take value of while statement"))))
 
 (cintrinsic* 'while
              (fn [test & body]
-               (let [body (if (= (count body) 1)
-                            (cstatement (first body))
-                            (apply cblock body))]
+               (let [body (apply cblock body)]
                  (WhileStatement.
                   (cexpand test)
                   body))))
@@ -1175,8 +1178,7 @@ Usage: (dispatch-hook #'hook-map)."
    (let [let-forms (first forms)
          body-forms (rest forms)]
      (assert (even? (count let-forms)) "let expression must contain an even number of forms")
-     (apply
-      cblock
+     (cstatements
       (concat
        (for [[decl expr-form] (partition 2 let-forms)]
          (let [init-expr (cexpand expr-form)
@@ -1201,13 +1203,16 @@ Usage: (dispatch-hook #'hook-map)."
 
 (cintrinsic*
  'declare
- (fn [sym]
+ (fn [sym & args]
    (if-let [decl-type (get-var-type-tag (meta sym))]
-     (let [sym-name (name sym)]
+     (let [sym-name (name sym)
+           init-expr (first args)
+           init-expr (when init-expr (cexpand init-expr))]
        (add-local
         (create-var-decl
          sym-name
-         decl-type))
+         decl-type
+         init-expr))
        nil)
      (throw (ArgumentException.
              (str "Unable to infer type for declare expression of symbol" sym))))))
@@ -1329,7 +1334,7 @@ Usage: (dispatch-hook #'hook-map)."
                 local-decls (vec (doall (map cstatement *local-decls*)))
                 body-statements (concat local-decls body-statements)
                 body-block (if (and (= 1 (count body-statements))
-                                    (= :block (expr-category (first body-statements))))
+                                    (instance? BlockExpression (first body-statements)))
                              (first body-statements)
                              (BlockExpression. body-statements))
                 body-block
