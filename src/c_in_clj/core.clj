@@ -30,7 +30,8 @@
   (get-fields [this])
   (create-field-access-expr
     [this instance-expr field-name]
-    [this instance-expr field-name pointer-depth]))
+    [this instance-expr field-name pointer-depth])
+  (dereferenced-type [this]))
 
 (defprotocol IDeclaration
   (write-decl [this])
@@ -367,7 +368,8 @@ Usage: (dispatch-hook #'hook-map)."
   (write-decl-expr [_ var-name] (str (write-decl-expr underlying-type var-name)
                                      "[" array-length "]"))
   (is-reference-type? [_] true)
-  (is-function-type? [_] false))
+  (is-function-type? [_] false)
+  (dereferenced-type [_] underlying-type))
 
 (declare lookup-symbol)
 
@@ -879,7 +881,8 @@ Usage: (dispatch-hook #'hook-map)."
 (cop aget [x y]
      (write [_] (write-str x "[" y "]"))
      IHasType
-     (get-type [_]))
+     (get-type [_]
+               (lookup-type (dereferenced-type (get-type x)))))
 
 (defrecord ArraySetExpression [target idx value]
   IHasType
@@ -1170,6 +1173,24 @@ Usage: (dispatch-hook #'hook-map)."
   (expr-category [_]))
 
 (cintrinsic continue [] (ContinueStatement.))
+
+(defrecord LabelStatement [label]
+  IHasType
+  (get-type [_])
+  IExpression
+  (write [_] (str (name label) ":"))
+  (expr-category [_] :statement))
+
+(cintrinsic* 'label (fn [x] (LabelStatement. x)))
+
+(defrecord GotoExpression [label]
+  IHasType
+  (get-type [_])
+  IExpression
+  (write [_] (str "goto " (name label)))
+  (expr-category [_]))
+
+(cintrinsic* 'goto (fn [x] (GotoExpression. x)))
 
 (defn- add-local [decl]
   (let [var-name (name decl)]
