@@ -40,11 +40,9 @@
 (defrecord CompileSource [source body-source filename])
 
 (defprotocol ISymbolScope
-  (add-symbol [this decl])
   (resolve-symbol [this symbol-name]))
 
 (defprotocol ITypeScope
-  (add-type [this decl])
   (resolve-type [this type-name]))
 
 (defprotocol ICompileContext
@@ -91,14 +89,16 @@
 (defprotocol IPackage
   (add-declaration [this decl]))
 
-(defn look-in-referenced-packages [referenced-packages target-sym accessor]
+(defn look-in-referenced-packages [referenced-packages target-sym]
   (loop [[rp & more] (vec @referenced-packages)]
     (when rp
-      (if-let [s (get @(get rp accessor) target-sym)]
-        s
+      (if-let [decl (get @(:symbols rp) target-sym)]
+        (if-not (:private (meta decl))
+          decl
+          (recur more))
         (recur more)))))
 
-(defrecord Package [package-name module declarations public-symbols public-types private-symbols private-types referenced-packages]
+(defrecord Package [package-name module declarations symbols referenced-packages]
   clojure.lang.Named
   (getName [_] package-name)
   IPackage
@@ -108,33 +108,15 @@
             existing-idx (find-index-of @declarations #(= (name %) decl-name))]
         (if existing-idx
           (swap! declarations assoc existing-idx decl)
-          (swap! declarations conj decl)))))
+          (swap! declarations conj decl))))
+    (when-let [decl-name (name decl)]
+      (swap! symbols assoc decl-name decl)))
   ISymbolScope
-  (add-symbol [this decl]
-    (add-declaration this decl)
-    (if (:private (meta decl))
-      (swap! private-symbols assoc (name decl) decl)
-      (swap! public-symbols assoc (name decl) decl)))
   (resolve-symbol [_ sym-name]
-    (or (get @private-symbols sym-name)
-        (get @public-symbols sym-name)
+    (or (get @symbols sym-name)
         (look-in-referenced-packages referenced-packages
-                                     sym-name
-                                     :public-symbols)
-        (resolve-symbol module sym-name)))
-  ITypeScope
-  (add-type [this decl]
-    (add-declaration this decl)
-    (if (:private (meta decl))
-      (swap! private-types assoc (name decl) decl)
-      (swap! public-types assoc (name decl) decl)))
-  (resolve-type [_ type-name]
-    (or (get @private-types type-name)
-        (get @public-types type-name)
-        (look-in-referenced-packages referenced-packages
-                                     type-name
-                                     :public-types)
-        (resolve-type module type-name))))
+                                     sym-name)
+        (resolve-symbol module sym-name))))
 
 (defmethod print-method Package [o w]
   (print-simple (str "#" o (select-keys o [:package-name :module])) w))
@@ -198,7 +180,7 @@
   (let [module (eval module)
         package-name (name package-sym)
         package (cond (instance? Module module)
-               (Package. package-name module (atom []) (atom {}) (atom {}) (atom {}) (atom {}) (atom #{}))
+               (Package. package-name module (atom []) (atom {}) (atom #{}))
                (instance? RuntimeModule module)
                (RuntimePackage. package-name module))]
     (when (instance? Module module)
@@ -206,7 +188,31 @@
     (swap! packages-by-ns assoc *ns* package)
     `(def ~package-sym ~package)))
 
-(defn get-package [] (get @packages-by-ns *ns*))
+(defn cpackage-clone [module {:keys [declarations symbols
+                                     referenced-packages package-name] :as package}]
+  (when (instance? Module module)
+    (let [ndecls (atom [])
+          nref-pkgs (atom #{})
+          new-syms (atom {})
+          new-pkg (Package. package-name module ndecls new-syms nref-pkgs)]
+      (doseq [[k v] @symbols]
+        (let [nsym (assoc v :package new-pkg)]
+          (swap! new-syms assoc k nsym)))
+      (doseq [decl @declarations]
+        (let [ndecl (or (get @symbols (name decl))
+                        (assoc decl :package new-pkg))]
+          (swap! ndecls conj ndecl)))
+      (doseq [{:keys [package-name]} @referenced-packages]
+        (if-let [rpkg (get @(:packages module) package-name)]
+          (swap! nref-pkgs conj rpkg)
+          (throw (ex-info (str "In order to clone package " (name new-pkg) " package "
+                               package-name " must be cloned as well.") {}))))
+      (swap! (:packages module) assoc package-name new-pkg)
+      new-pkg)))
+
+(def ^:dynamic *package* nil)
+
+(defn get-package [] (or *package* (get @packages-by-ns *ns*)))
 
 (defn get-module [] (:module (get-package)))
 
@@ -385,7 +391,8 @@ Usage: (dispatch-hook #'hook-map)."
                  (lookup-type alias)
                  (if (.EndsWith type-name "*")
                    (PointerType. (lookup-type (.Substring type-name 0 (dec (.Length type-name)))))
-                   (resolve-type (get-package) type-name)))))))]
+                   (when-let [typ (resolve-symbol (get-package) type-name)]
+                     (when (satisfies? IType typ) typ))))))))]
     (add-referenced-decl resolved-type)
     resolved-type))
 
@@ -1236,7 +1243,7 @@ Usage: (dispatch-hook #'hook-map)."
   IField
   (get-bitfield-width [_] bits))
 
-(defrecord Struct [package struct-name fields]
+(defrecord Struct [package struct-name fields field-map]
   clojure.lang.Named
   (getName [_] struct-name)
   IHasType
@@ -1255,16 +1262,17 @@ Usage: (dispatch-hook #'hook-map)."
          " " var-name))
   (create-explicit-cast-expr [this expr]
     (DefaultCastExpression. this expr))
-  (get-fields [this] fields)
-  (create-field-access-expr [this instance-expr field-name])
+  (get-fields [this] field-map)
+  (create-field-access-expr [this instance-expr field-name]
+    (create-field-access-expr this instance-expr field-name 0))
   (create-field-access-expr [this instance-expr field-name pointer-depth]
-    (when-let [field (get fields (name field-name))]
+    (when-let [field (get field-map (name field-name))]
       (StructFieldAccessExpression. instance-expr field pointer-depth)))
   IDeclaration
   (write-decl [_]
     (str "typedef struct " struct-name " {\n"
        (str/join
-        (for [[field-name field] fields]
+        (for [field fields]
           (str "\t"
                (write-decl-expr (get-type field)
                                 (name field))
@@ -1276,17 +1284,18 @@ Usage: (dispatch-hook #'hook-map)."
 
 (defn cstruct* [struct-name members]
   (let [package (get-package)
+        fields (vec
+                (for [[type-name field-name bits] members]
+                  (StructField. (name field-name) type-name bits)))
         struct
         (Struct.
          package
          (name struct-name)
-         (into (array-map)
-               (for [[type-name field-name bits] members]
-                 [(name field-name)
-                  (StructField. (name field-name) (name type-name) bits)]))
+         fields
+         (into {} (for [f fields] [(name f) f]))
          (meta struct-name)
          nil)]
-    (add-type package struct)
+    (add-declaration package struct)
     (println (write-decl struct))))
 
 (defmacro cstruct [name & members]
@@ -1352,7 +1361,7 @@ Usage: (dispatch-hook #'hook-map)."
                 func-name (name func-name)
                 func-type (FunctionType. ret-type params)
                 func-decl (FunctionDeclaration. package func-name func-type body-block *referenced-decls* *locals* func-metadata nil)]
-            (add-symbol package func-decl)
+            (add-declaration package func-decl)
             func-decl))))))
 
 ;; (defn- write-dev-header [referenced-decls]
@@ -1475,7 +1484,7 @@ Usage: (dispatch-hook #'hook-map)."
         typedef-name (name typedef-name)
         target-type (lookup-type target-type)
         decl (TypeDef. package typedef-name target-type metadata nil)]
-    (add-type package decl)
+    (add-declaration package decl)
     (write-decl decl)))
 
 (defmacro ctypedef
@@ -1508,12 +1517,12 @@ Usage: (dispatch-hook #'hook-map)."
   clojure.lang.Named
   (getName [_] enum-name)
   IDeclaration
-  (write-decl [_] (str "enum " enum-name
-                       " {"
+  (write-decl [_] (str "typedef enum " 
+                       "{"
                        (str/join
                         ", "
                         (map #(str (:name %) " = " (:value %)) values))
-                       "};"))
+                       "} " enum-name ";"))
   (write-impl [_])
   (decl-package [_] package)
   IType
@@ -1544,9 +1553,9 @@ Usage: (dispatch-hook #'hook-map)."
                                  enum-name)
                     values)
         enum (EnumType. package enum-name values)]
-    (add-type package enum)
+    (add-declaration package enum)
     (doseq [v values]
-      (add-symbol package v))
+      (add-declaration package v))
     (println (write-decl enum))))
 
 (defmacro cenum [enum-name values]
@@ -1592,51 +1601,53 @@ Usage: (dispatch-hook #'hook-map)."
         var-type (lookup-type tag)
         init-expr (when init-expr (cexpand init-expr))
         var-decl (GlobalVariableDeclaration. package var-name var-type init-expr metadata nil)]
-    (add-symbol package var-decl)
+    (add-declaration package var-decl)
     var-decl))
 
 (defn cdef* [& forms]
   (do-compile-decls [forms] parse-cdef))
 
 (defn write-package-source [{:keys [declarations module] :as package} & {:keys [src-output-path cpp-mode]}]
-  (let [{:keys [preamble]} module
-        pkg-name (name package)
-        header-name (str pkg-name ".h")
-        include-guard-name (.ToUpper
-                            (str "_" (name module) "__" pkg-name "__H_"))
-        public-decls (filter #(not (:private (meta %))) @declarations)
-        private-decls (filter #(:private (meta %)) @declarations)
-        decl-src
-        (str "#ifndef " include-guard-name "\n"
-             "#define " include-guard-name "\n\n"
-             preamble
-             "\n"
-             (str/join "\n\n"
-                       (remove empty?
-                               (for [decl public-decls]
-                                 (write-decl decl))))
-             "\n\n#endif // " include-guard-name "\n")
-       
-        impl-src
-        (str
-         "#include \"" header-name "\"\n\n"
-         (str/join "\n\n"
-                   (remove empty?
-                           (concat
-                            (for [decl private-decls]
-                              (write-decl decl))
-                            (for [decl @declarations]
-                              (write-impl decl))))))]
-    (when src-output-path
-      (let [decl-path (Path/Combine src-output-path header-name)
-            impl-path (Path/Combine src-output-path
-                                    (str pkg-name
-                                         (if cpp-mode ".cpp" ".c")))]
+  (binding [*package* package]
+    (let [{:keys [preamble]} module
+          pkg-name (name package)
+          header-name (str pkg-name ".h")
+          include-guard-name (.ToUpper
+                              (str "_" (name module) "__" pkg-name "__H_"))
+          public-decls (filter #(not (:private (meta %))) @declarations)
+          private-decls (filter #(:private (meta %)) @declarations)
+          decl-src
+          (str "#ifndef " include-guard-name "\n"
+               "#define " include-guard-name "\n\n"
+               preamble
+               "\n"
+               (str/join "\n\n"
+                         (remove empty?
+                                 (for [decl public-decls]
+                                   (write-decl decl))))
+               "\n\n#endif // " include-guard-name "\n")
+          
+          impl-src
+          (str
+           "#include \"" header-name "\"\n\n"
+           (str/join "\n\n"
+                     (remove empty?
+                             (concat
+                              (for [decl private-decls]
+                                (write-decl decl))
+                              (for [decl @declarations]
+                                (write-impl decl)))))
+           "\n")]
+      (when src-output-path
+        (let [decl-path (Path/Combine src-output-path header-name)
+              impl-path (Path/Combine src-output-path
+                                      (str pkg-name
+                                           (if cpp-mode ".cpp" ".c")))]
 
-        (println "Writing" decl-path)
-        (println "Writing" impl-path)
-        (File/WriteAllText decl-path decl-src)
-        (File/WriteAllText impl-path impl-src)))))
+          (println "Writing" decl-path)
+          (println "Writing" impl-path)
+          (File/WriteAllText decl-path decl-src)
+          (File/WriteAllText impl-path impl-src))))))
 
 (defn write-module-source [{:keys [packages cpp-mode src-output-path] :as module}]
   (doseq [[_ pkg] @packages]

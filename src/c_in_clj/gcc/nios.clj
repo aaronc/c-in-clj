@@ -23,6 +23,24 @@
       (Directory/CreateDirectory dir))
     dir))
 
+(defn nios-shell-exec [args & {:keys [env work-dir force-output]}]
+  (let [psi (ProcessStartInfo. (nios-cmd-shell-path))]
+    (set! (.Arguments psi) args)
+    (doseq [[k v] env]
+      (.Add (.EnvironmentVariables psi) k v))
+    (.set_UseShellExecute psi false)
+    (.set_RedirectStandardOutput psi true)
+    (when work-dir (.set_WorkingDirectory psi work-dir))
+    (let [process (Process/Start psi)
+          output (.ReadToEnd (.StandardOutput process))]
+      (.WaitForExit process)
+      (let [exit-code (.ExitCode process)]
+        (if (or (not= 0 exit-code) force-output)
+          (do
+            (println output)
+            (println "Exited with " exit-code)))
+        exit-code))))
+
 (defn run-gcc [gcc-args {:keys [env work-dir]}]
   (let [psi (ProcessStartInfo. (nios-cmd-shell-path))
         args (apply str "nios2-elf-gcc " gcc-args)]
@@ -108,6 +126,8 @@
         )
       ;;(gdb/kill-gdb gdb-client)
       )))
+
+(declare continue)
 
 (defn bootstrap-nios [elf-filename srec-filename]
   (let [port (+ 4444 (rand-int 5555))
