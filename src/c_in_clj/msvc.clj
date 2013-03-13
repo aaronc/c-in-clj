@@ -40,27 +40,35 @@
 
 (defrecord CompiledSymbolRef [symbol-name fn-ptr-ptr cur-decl cur-fn-ptr cur-dll-info invoker])
 
-(defn get-clr-type [ctype]
-  (let [ctype (lookup-type ctype)]
-    (let [type-name (name ctype)]
-      (case type-name
-        "int8_t" SByte
-        "int16_t" Int16
-        "int32_t" Int32
-        "int64_t" Int64
-        "uint8_t" Byte
-        "uint16_t" UInt16
-        "uint32_t" UInt32
-        "uint64_t" UInt64
-        "bool" Boolean
-        "size_t" UIntPtr
-        "char" Char
-        "..." IntPtr
-        (when (is-reference-type? ctype)
-          IntPtr)))))
+(defn get-clr-type [decl-or-type & {:keys [throw?]}]
+  (let [{:keys [marshal-as] :as metadata} (meta decl-or-type)]
+    (or
+     (eval marshal-as)
+     (let [ctype (if (satisfies? IHasType decl-or-type) (get-type decl-or-type) decl-or-type)
+           ctype (lookup-type ctype)]
+       (let [type-name (name ctype)]
+         (case type-name
+           "int8_t" SByte
+           "int16_t" Int16
+           "int32_t" Int32
+           "int64_t" Int64
+           "uint8_t" Byte
+           "uint16_t" UInt16
+           "uint32_t" UInt32
+           "uint64_t" UInt64
+           "bool" Boolean
+           "size_t" UIntPtr
+           "char" Char
+           "double" Double
+           "float" Single
+           "..." IntPtr
+           (if (is-reference-type? ctype)
+             IntPtr
+             (when throw?
+               (throw (ex-info (str "Unable to find clr type for c type " type-name) {:c-type ctype}))))))))))
 
 (defn get-clr-params [params]
-  (map (comp get-clr-type get-type) params))
+  (map get-clr-type params))
 
 (defn- get-clr-type-size [^Type t]
   (let [t (cond (= String t) IntPtr
@@ -83,18 +91,29 @@
           (swap! dg-type-cache assoc dg-sig dg-type)
           dg-type))))
 
+(defmacro gen-c-delegate [ret params args & body]
+  (let [dg-type (get-dg-type (eval ret) (eval params))]
+    `(let [dg# (gen-delegate ~dg-type ~args ~@body)
+           gch# (System.Runtime.InteropServices.GCHandle/Alloc
+                 dg#)
+           fp# (System.Runtime.InteropServices.Marshal/GetFunctionPointerForDelegate dg#)]
+       {:dg dg#
+        :gch gch#
+        :fp fp#})))
+
 (defn- make-invoker [fn-ptr decl]
-  (let [decl-type (get-type decl)]
-    (if (:function-type decl)
-      (let [{:keys [params return-type]} decl-type
-            clr-ret (get-clr-type return-type)
-            clr-params (map (comp get-clr-type get-type) params)
-            dg-type (get-dg-type clr-ret clr-params)
-            dg (Marshal/GetDelegateForFunctionPointer fn-ptr dg-type)
-            invoke-method (.GetMethod dg-type "Invoke")]
-        (fn [& args]
-          (.Invoke invoke-method dg (to-array args))))
-      fn-ptr)))
+  (when-not (:disable-gen-invoke (meta decl))
+    (let [decl-type (get-type decl)]
+      (if (:function-type decl)
+        (let [{:keys [params return-type]} decl-type
+              clr-ret (get-clr-type return-type)
+              clr-params (map #(get-clr-type % :throw? true) params)
+              dg-type (get-dg-type clr-ret clr-params)
+              dg (Marshal/GetDelegateForFunctionPointer fn-ptr dg-type)
+              invoke-method (.GetMethod dg-type "Invoke")]
+          (fn [& args]
+            (.Invoke invoke-method dg (to-array args))))
+        fn-ptr))))
 
 (defn- msvc-compile-decls [{:keys [temp-output-path cl-args cl-bat-path compiled-symbols dll-handles] :as ctxt} decls {:keys [source filename]}]
   (when (run-cl temp-output-path

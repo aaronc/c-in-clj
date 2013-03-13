@@ -358,7 +358,9 @@ Usage: (dispatch-hook #'hook-map)."
   (write-decl-expr [_ var-name] (str type-name " " var-name))
   (write-decl-expr [_ var-name pointer-depth] (str type-name (apply str (repeat pointer-depth "*")) " " var-name))
   (is-reference-type? [_])
-  (is-function-type? [_]))
+  (is-function-type? [_])
+  (create-explicit-cast-expr [this expr]
+    (DefaultCastExpression. this expr)))
 
 (defrecord StaticArrayType [underlying-type array-length]
   clojure.lang.Named
@@ -565,7 +567,25 @@ Usage: (dispatch-hook #'hook-map)."
     (add-referenced-decl resolved-symbol)
     resolved-symbol))
 
-(defn lookup-macro [macro-name])
+(defrecord CMacro [name func]
+  clojure.lang.Named
+  (getName [_] name))
+
+(defn cmacro* [macro-name func]
+  (let [macro (CMacro. macro-name func)]
+    (c-in-clj.core/add-declaration (c-in-clj.core/get-package) macro)
+    macro))
+
+(defmacro cmacro [macro-name params & body]
+  `(let [func#
+         (fn ~(symbol (str macro-name "-macro")) ~params
+           (unqualify-symbols (do ~@body)))]
+     (c-in-clj.core/cmacro* ~(name macro-name) func#)))
+
+(defn lookup-macro [macro-name]
+  (let [macro? (lookup-symbol macro-name)]
+    (when (instance? CMacro macro?)
+      macro?)))
 
 (def ^:private cintrinsics (atom {}))
 
@@ -586,8 +606,8 @@ Usage: (dispatch-hook #'hook-map)."
                                     (first args)
                                     (.Substring sym-name 1)
                                     (rest args)))
-          (if-let [macro (lookup-macro sym)]
-            (cexpand (apply macro args))
+          (if-let [{:keys [func]} (lookup-macro sym)]
+            (cexpand (apply func args))
             (if-let [local-func (get *locals* sym)]
               (AnonymousFunctionCallExpression. (name sym) (map cexpand args))
               (if (lookup-symbol sym)
@@ -789,7 +809,6 @@ Usage: (dispatch-hook #'hook-map)."
 (cassignop bit-shift-right= ">>=")
 (cbinop* bit-xor "^")
 (cassignop bit-xor= "^=")
-(cbinop* bit-not "~")
 (cassignop bit-not= "~=")
 (cassignop set! "=")
 
@@ -809,6 +828,7 @@ Usage: (dispatch-hook #'hook-map)."
 (cunop dec [x] (write-str "--" x))
 (cunop post-inc [x] (write-str x "++"))
 (cunop post-dec [x] (write-str x "--"))
+(cunop bit-not [x] (write-str "~" x))
 
 (cop not [x]
      (write [_] (str "!" (write x)))
@@ -1368,7 +1388,7 @@ Usage: (dispatch-hook #'hook-map)."
                              (first body-statements)
                              (BlockExpression. body-statements))
                 body-block
-                (if has-return
+                (if (and has-return (not (:disable-default-return func-metadata)))
                   (wrap-last
                    body-block
                    (fn [expr]
@@ -1459,7 +1479,11 @@ Usage: (dispatch-hook #'hook-map)."
         sym (with-meta sym metadata)]
     `(c-in-clj.core/cdefn ~sym ~@forms)))
 
-;;(defmacro cdefns [])
+(defn cdefns* [& fns]
+  (compile-cfns fns))
+
+(defmacro cdefns [& fns]
+  (apply cdefns* fns))
 
 (defn unqualify-symbols [form]
   (if (seq? form)
@@ -1676,10 +1700,13 @@ Usage: (dispatch-hook #'hook-map)."
 
 (defmacro cdef [& forms] (apply cdef* forms))
 
-;; ;;; Test code
-(csource-module TestModule :dev true)
+(defrecord RawCHeader [package txt]
+  clojure.lang.Named
+  (getName [_])
+  IDeclaration
+  (write-decl [_] (str txt "\n"))
+  (write-impl [_])
+  (decl-package [_] package ))
 
-(cpackage TestModule test1)
-
-;; (cdefn ^void t1 [^i32 x]
-;;        (+ x 1))
+(defn cheader [raw-header]
+  (add-declaration (get-package) (RawCHeader. (get-package) raw-header)))
