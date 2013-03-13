@@ -350,6 +350,26 @@ Usage: (dispatch-hook #'hook-map)."
   (create-field-access-expr [this instance-expr member-name pointer-depth]
     (create-field-access-expr type instance-expr member-name pointer-depth)))
 
+(defrecord AnonymousFieldAccessExpression [instance-expr member-name pointer-depth]
+  IHasType
+  (get-type [_])
+  IExpression
+  (expr-category [_])
+  (write [_]
+    (let [prefix-pointer (when (>= pointer-depth 2)
+                           (- pointer-depth 2))
+          pointer-depth (if prefix-pointer 1
+                            pointer-depth)]
+      (str
+       (when prefix-pointer
+         (apply str "(" (repeat prefix-pointer "*")))
+       (write instance-expr)
+       (when prefix-pointer ")")
+       (case pointer-depth
+         0 "."
+         1 "->")
+       (name member-name)))))
+
 (defrecord AnonymousType [type-name]
   clojure.lang.Named
   (getName [_] type-name)
@@ -360,7 +380,11 @@ Usage: (dispatch-hook #'hook-map)."
   (is-reference-type? [_])
   (is-function-type? [_])
   (create-explicit-cast-expr [this expr]
-    (DefaultCastExpression. this expr)))
+    (DefaultCastExpression. this expr))
+  (create-field-access-expr [this instance-expr member-name]
+    (create-field-access-expr this instance-expr member-name 0))
+  (create-field-access-expr [this instance-expr member-name pointer-depth]
+    (AnonymousFieldAccessExpression. instance-expr member-name pointer-depth)))
 
 (defrecord StaticArrayType [underlying-type array-length]
   clojure.lang.Named
@@ -514,7 +538,7 @@ Usage: (dispatch-hook #'hook-map)."
   IHasType
   (get-type [this] (get-type func-expr)))
 
-(defrecord VariableDeclaration [var-name var-type init-expr]
+(defrecord VariableDeclaration [var-name var-type]
   clojure.lang.Named
   (getName [_] var-name)
   IHasType
@@ -523,12 +547,12 @@ Usage: (dispatch-hook #'hook-map)."
   (expr-category [_])
   (write [_]
     (str (write-decl-expr (lookup-type var-type) var-name)
-         (when init-expr (str " = " (write init-expr))))))
+         ;;(when init-expr (str " = " (write init-expr)))
+         )))
 
 (defn create-var-decl
-  ([var-name var-type] (create-var-decl var-name var-type nil))
-  ([var-name var-type init-expr]
-      (VariableDeclaration. var-name var-type init-expr)))
+  ([var-name var-type]
+      (VariableDeclaration. var-name var-type)))
 
 (defrecord VariableRefExpression [variable]
   IExpression
@@ -1249,22 +1273,24 @@ Usage: (dispatch-hook #'hook-map)."
   (let [tag (:tag metadata)]
     (if (string? tag) (keyword tag) tag)))
 
-(cintrinsic*
- 'declare
- (fn [sym & args]
-   (if-let [decl-type (get-var-type-tag (meta sym))]
-     (let [sym-name (name sym)
-           init-expr (first args)
-           init-expr (when init-expr (cexpand init-expr))]
-       (add-local
-        (create-var-decl
-         sym-name
-         decl-type
-         init-expr))
-       nil)
+(defn- declare-fn [sym]
+  (if-let [decl-type (get-var-type-tag (meta sym))]
+    (do
+      (add-local
+       (create-var-decl (name sym) decl-type))
+      nil)
      (throw (ArgumentException.
-             (str "Unable to infer type for declare expression of symbol" sym))))))
+             (str "Unable to infer type for declare expression of symbol" sym)))))
 
+(cintrinsic* 'declare declare-fn)
+
+(def ^:private set!-fn (get @cintrinsics 'set!))
+
+(cintrinsic*
+ 'def
+ (fn def-fn [sym init-expr]
+   (declare-fn sym)
+   (set!-fn sym init-expr)))
 
 ;; (defn create-cfn-body [name args body]
 ;;   (binding [*locals* (extract-locals args)]
