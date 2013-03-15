@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd">
+    <metadata>
+        <id>c-in-clj</id>
+        <version>0.1.0</version>
+        <authors>Aaron Craelius</authors>
+        <requireLicenseAcceptance>false</requireLicenseAcceptance>
+        <licenseUrl>http://opensource.org/licenses/eclipse-1.0.php</licenseUrl>
+        <projectUrl>https://github.com/aaronc/ClojureClrEx</projectUrl>
+        <description>My library of extensions for ClojureCLR</description>
+        <tags>clojure clojureclr</tags>
+        <dependencies>
+          <dependency id="Clojure" version="1.4.0" />
+          <dependency id="ClojureClrEx" version="0.1.3" />
+          <dependency id="clj-parse" version="0.4.4" />
+        </dependencies>
+    </metadata>
+    <files>
+        <file src="bin\c-in-clj.dll" target="lib\net40" />
+    </files>
+</package>
