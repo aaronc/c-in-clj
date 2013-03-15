@@ -232,7 +232,7 @@
       "cl.exe"))
     cl-bat-path))
 
-(defn create-msvc-compile-context [opts]
+(defn- create-msvc-compile-context [opts]
   (let [{:keys [msvc-path temp-output-path] :as opts}
         (merge {:cl-args default-msvc-args
                 :msvc-path default-msvc-path}
@@ -243,44 +243,52 @@
                opts)]
     (MSVCCompileContext. (atom {}) (atom #{}) nil opts)))
 
-(defn dll-load-symbol [{:keys [opts]} package-name symbol-name])
+(defn- dll-load-symbol [{:keys [dll-name] :as loader} package-name {:keys [name ret-type params type var-type] :as sym-info}]
+  (if (= type :function)
+    (let [clr-ret (get-clr-type ret-type)
+          clr-params (get-clr-params params)]
+      (dllimport* dll-name name clr-ret clr-params))
+    (throw (ex-info (str "Don't know how to load symbol " name " of type " type) sym-info))))
 
-(defrecord DllLoader [opts]
+(defrecord DllLoader []
   ILoadContext
-  (load-symbol [this package-name symbol-name]
-    (dll-load-symbol this package-name symbol-name)))
+  (load-symbol [this package-name symbol-info]
+    (dll-load-symbol this package-name symbol-info)))
 
-(defn create-dll-loader [{:keys [] :as opts}]
-  (DllLoader. opts))
+(defn create-dll-loader [{:keys [dll-name module-name] :as opts}]
+  (let [opts (merge {:dll-name (str module-name ".dll")} opts)]
+    (DllLoader. nil opts)))
 
 (defmacro msvc-module
-  [module-name & {:as opts}]
-  (let [opts (merge {:cpp-mode true} opts)]
-    `(def ~module-name
+  [module-sym & {:as opts}]
+  (let [module-name (name module-sym)
+        opts (merge {:cpp-mode true
+                     :module-name module-name} opts)]
+    `(def ~module-sym
        (create-module
-        ~(name module-name)
+        ~module-name
         #'create-msvc-compile-context
         #'create-dll-loader
         ~opts))))
 
-(msvc-module TestMsvcModule :dev true)
+;; (msvc-module TestMsvcModule)
 
-(cpackage TestMsvcModule test_msvc1)
+;; (cpackage TestMsvcModule test_msvc1)
 
-(cdefn ^i32 t1 [^i32 x] (+ x 7))
+;; (cdefn ^i32 t1 [^i32 x] (+ x 7))
 
-(cdefn ^char* t2 [] "Hello World!")
+;; (cdefn ^char* t2 [] "Hello World!")
 
-(cdefn ^char* t3 [^char* str0]
-       (aset str0 0 \b)
-       str0)
+;; (cdefn ^char* t3 [^char* str0]
+;;        (aset str0 0 \b)
+;;        str0)
 
-(cstruct T1
-         (i32 a))
+;; (cstruct T1
+;;          (i32 a))
 
 ;; (cdefn ^void t4 []
 ;;        (declare ^T1 x)
 ;;        (set! (. x a) 5))
 
-(cdefn ^i32 t5 []
-        (t1 3))
+;; (cdefn ^i32 t5 []
+;;         (t1 3))

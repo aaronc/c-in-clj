@@ -90,7 +90,7 @@
 (defprotocol IPackage
   (add-declaration [this decl]))
 
-(defn look-in-referenced-packages [referenced-packages target-sym]
+(defn- look-in-referenced-packages [referenced-packages target-sym]
   (loop [[rp & more] (vec @referenced-packages)]
     (when rp
       (if-let [decl (get @(:symbols rp) target-sym)]
@@ -123,20 +123,39 @@
   (print-simple (str "#" o (select-keys o [:package-name :module])) w))
 
 (defprotocol ILoadContext
-  (load-symbol [this package-name symbol-name]))
+  (load-symbol [this package-name symbol-info]))
 
 (def null-loader-context
   (reify ILoadContext
     (load-symbol [this package-name symbol-name])))
 
-(defrecord RuntimeModule [name loader packages])
+(defrecord RuntimeModule [module-name loader packages])
 
-(defrecord RuntimePackage [name module])
+(defmethod print-method RuntimeModule [o w]
+  (print-simple (str "#" o (select-keys o [:module-name :loader])) w))
+
+(defrecord RuntimePackage [package-name module symbols referenced-packages]
+  IPackage
+  (add-declaration [this decl]
+    (when-let [decl-name (name decl)]
+      (swap! symbols assoc decl-name decl)))
+  ISymbolScope
+  (resolve-symbol [_ sym-name]
+    (or (get @symbols sym-name)
+        (look-in-referenced-packages referenced-packages
+                                     sym-name)
+        (resolve-symbol module sym-name))))
+
+(defmethod print-method RuntimePackage [o w]
+  (print-simple (str "#" o (select-keys o [:package-name :module])) w))
 
 (def ^:private packages-by-ns (atom {}))
 
+(def ^:dynamic *c-in-clj-dev-mode* false)
+
 (defn dev-env? []
-  (= (Environment/GetEnvironmentVariable "C_IN_CLJ_DEV") "true"))
+  (or *c-in-clj-dev-mode* (when-let [dev-var (Environment/GetEnvironmentVariable "C_IN_CLJ_DEV")]
+                        (not= "0" dev-var))))
 
 (def default-c-preamble
   "#include <stddef.h>\n#include <stdint.h>\n#include <stdbool.h>\n")
@@ -180,12 +199,12 @@
 (defmacro cpackage [module package-sym]
   (let [module (eval module)
         package-name (name package-sym)
-        package (cond (instance? Module module)
-               (Package. package-name module (atom []) (atom {}) (atom #{}))
-               (instance? RuntimeModule module)
-               (RuntimePackage. package-name module))]
-    (when (instance? Module module)
-      (swap! (:packages module) assoc package-name package))
+        package
+        (cond (instance? Module module)
+              (Package. package-name module (atom []) (atom {}) (atom #{}))
+              (instance? RuntimeModule module)
+              (RuntimePackage. package-name module (atom {}) (atom #{})))]
+    (swap! (:packages module) assoc package-name package)
     (swap! packages-by-ns assoc *ns* package)
     `(def ~package-sym ~package)))
 
@@ -217,7 +236,7 @@
 
 (defn get-module [] (:module (get-package)))
 
-(defn apply-hook [hook-name expr]
+(defn- apply-hook [hook-name expr]
   (let [compile-ctxt (:compile-ctxt (get-module))]
     (write-hook compile-ctxt hook-name expr)))
 
@@ -239,7 +258,12 @@ Usage: (dispatch-hook #'hook-map)."
   (when-let [hook-impl (get @(:hook-map (meta hooks)) hook-name)]
     (hook-impl ctxt expr)))
 
-(defn dev-mode? [module] (instance? Module module))
+(defn dev-mode?
+  ([]
+     (if-let [pkg (get-package)]
+       (dev-mode? (get-module))
+       (dev-env?)))
+  ([module] (instance? Module module)))
 
 (def ^:private ^:dynamic *locals* nil)
 
@@ -259,7 +283,7 @@ Usage: (dispatch-hook #'hook-map)."
 
 (def ^:private ^:dynamic *dynamic-compile-header* nil)
 
-(defn add-referenced-decl [resolved]
+(defn- add-referenced-decl [resolved]
   ;; (println "trying to add ref to" (name resolved)
   ;;          (satisfies? IDeclaration resolved)
   ;;          *referenced-decls*)
@@ -480,7 +504,7 @@ Usage: (dispatch-hook #'hook-map)."
   (is-reference-type? [this] false)
   (is-function-type? [_] true))
 
-(defn write-function-signature [{:keys [function-name function-type] :as decl} ]
+(defn- write-function-signature [{:keys [function-name function-type] :as decl} ]
   (let [{:keys [return-type params]} function-type]
     (str
      (apply-hook :before-function-signature decl)
@@ -550,7 +574,7 @@ Usage: (dispatch-hook #'hook-map)."
          ;;(when init-expr (str " = " (write init-expr)))
          )))
 
-(defn create-var-decl
+(defn- create-var-decl
   ([var-name var-type]
       (VariableDeclaration. var-name var-type)))
 
@@ -570,7 +594,7 @@ Usage: (dispatch-hook #'hook-map)."
 
 (declare cexpand)
 
-(defn cexpand-num [x]
+(defn- cexpand-num [x]
   (let [ntype (type x)]
     (cond
      (= ntype Int64)
@@ -596,15 +620,17 @@ Usage: (dispatch-hook #'hook-map)."
   (getName [_] name))
 
 (defn cmacro* [macro-name func]
-  (let [macro (CMacro. macro-name func)]
-    (c-in-clj.core/add-declaration (c-in-clj.core/get-package) macro)
-    macro))
+  (when (dev-mode?)
+    (let [macro (CMacro. macro-name func)]
+      (c-in-clj.core/add-declaration (c-in-clj.core/get-package) macro)
+      macro)))
 
 (defmacro cmacro [macro-name params & body]
-  `(let [func#
-         (fn ~(symbol (str macro-name "-macro")) ~params
-           (unqualify-symbols (do ~@body)))]
-     (c-in-clj.core/cmacro* ~(name macro-name) func#)))
+  (when (dev-mode?)
+    `(let [func#
+           (fn ~(symbol (str macro-name "-macro")) ~params
+             (unqualify-symbols (do ~@body)))]
+       (c-in-clj.core/cmacro* ~(name macro-name) func#))))
 
 (defn lookup-macro [macro-name]
   (let [macro? (lookup-symbol macro-name)]
@@ -619,7 +645,7 @@ Usage: (dispatch-hook #'hook-map)."
           '~symbol-alias
           '~symbol-name))
 
-(defn cexpand-op-sym [sym args]
+(defn- cexpand-op-sym [sym args]
   (let [sym-name (name sym)]
     (if-let [alias (@symbol-aliases sym-name)]
       (cexpand-op-sym alias)
@@ -638,7 +664,7 @@ Usage: (dispatch-hook #'hook-map)."
                 (FunctionCallExpression. sym (map cexpand args))
                 (throw (ArgumentException. (str "Don't know how to handle list symbol " sym)))))))))))
 
-(defn cexpand-list [[op & args]]
+(defn- cexpand-list [[op & args]]
   (cond
    (symbol? op) (cexpand-op-sym op args)
    (keyword? op) (AnonymousFunctionCallExpression. (name op) (map cexpand args))
@@ -657,10 +683,10 @@ Usage: (dispatch-hook #'hook-map)."
   (expr-category [_])
   (write [_] (str "{" (str/join ", " (map write values)) "}")))
 
-(defn cexpand-vector [values]
+(defn- cexpand-vector [values]
   (InitializerList. (map cexpand values)))
 
-(defn cexpand [form]
+(defn- cexpand [form]
   (cond
    (satisfies? IExpression form) form
    (nil? form) null-literal
@@ -675,11 +701,11 @@ Usage: (dispatch-hook #'hook-map)."
    (vector? form) (cexpand-vector form)
    :default (throw (ArgumentException. (str "Don't know how to handle " form " of type " (type form))))))
 
-(defn is-block? [expr]
+(defn- is-block? [expr]
   (let [cat (expr-category expr)]
     (or (= :statement* cat) (= :block cat))))
 
-(defn cintrinsic* [sym func]
+(defn- cintrinsic* [sym func]
   (swap! cintrinsics assoc sym func))
 
 (defmacro cintrinsic [sym args & body]
@@ -702,7 +728,7 @@ Usage: (dispatch-hook #'hook-map)."
       (cintrinsic ~sym ~args
                   (new ~rec-sym ~@args)))))
 
-(defn get-bin-op-type [& args]
+(defn- get-bin-op-type [& args]
   (let [types (map get-type args)]
     (when (apply = types)
       (first types))))
@@ -737,7 +763,7 @@ Usage: (dispatch-hook #'hook-map)."
         IHasType
         (get-type [this#] 'bool)))
 
-(defn reduce-parens [^String expr]
+(defn- reduce-parens [^String expr]
   (when expr
     (if (.StartsWith expr "(")
       (let [len (.Length expr)
@@ -842,7 +868,7 @@ Usage: (dispatch-hook #'hook-map)."
         IHasType
         (get-type [this#] (get-type ~(first arg)))))
 
-(defn write-str [& args]
+(defn- write-str [& args]
   (apply str (for [arg args]
                (if (string? arg)
                  arg
@@ -969,7 +995,7 @@ Usage: (dispatch-hook #'hook-map)."
 
 (def ^:dynamic *indent* 0)
 
-(defn indent [] (str/join (for [x (range *indent*)] "\t")))
+(defn- indent [] (str/join (for [x (range *indent*)] "\t")))
 
 (defrecord Statement [expr noindent]
   IExpression
@@ -981,7 +1007,7 @@ Usage: (dispatch-hook #'hook-map)."
   IHasType
   (get-type [_] (get-type expr)))
 
-(defn cstatement [expr & {:keys [noindent]}]
+(defn- cstatement [expr & {:keys [noindent]}]
   (let [expr (cexpand expr)]
     (when expr
       (if (or (is-block? expr) (= :statement (expr-category expr)))
@@ -1002,7 +1028,7 @@ Usage: (dispatch-hook #'hook-map)."
   IHasType
   (get-type [_] (get-type (last statements))))
 
-(defn cstatements [statements]
+(defn- cstatements [statements]
   (Statements. (doall (map cstatement (remove nil? statements)))))
 
 (defrecord CaseExpression [test cases]
@@ -1132,7 +1158,7 @@ Usage: (dispatch-hook #'hook-map)."
          (str/join "\n" (map write statements)))
        "\n" (indent) "}")))
 
-(defn cblock [& statements]
+(defn- cblock [& statements]
   (BlockExpression. (doall (map cstatement (remove nil? statements)))))
 
 (cintrinsic* 'do cblock)
@@ -1363,7 +1389,8 @@ Usage: (dispatch-hook #'hook-map)."
          (meta struct-name)
          nil)]
     (add-declaration package struct)
-    (println (write-decl struct))))
+    (when (dev-mode?)
+      (println (write-decl struct)))))
 
 (defmacro cstruct [name & members]
   (cstruct* name members))
@@ -1393,8 +1420,9 @@ Usage: (dispatch-hook #'hook-map)."
         (let [param-type (get-var-type-tag metadata)]
           (FunctionParameter. param-name param-type metadata nil))))))
 
-(defn parse-cfn [package [func-name & forms]]
-  (let [f1 (first forms)
+(defn- parse-cfn [[func-name & forms]]
+  (let [package (get-package)
+        f1 (first forms)
         doc-str (when (string? f1) f1)
         params (if doc-str (second forms) f1)
         body-forms (if doc-str (nnext forms) (next forms))]
@@ -1430,6 +1458,15 @@ Usage: (dispatch-hook #'hook-map)."
                 func-decl (FunctionDeclaration. package func-name func-type body-block *referenced-decls* *locals* func-metadata nil)]
             (add-declaration package func-decl)
             func-decl))))))
+
+(defn- load-cfn [[func-name params & _]]
+  (let [func-metadata (meta func-name)
+        ret-type (get-var-type-tag func-metadata)
+        params (parse-fn-params params)
+        fn-info {:name func-name :ret-type ret-type :params params :type :function}
+        {:keys [loader]} (get-module)
+        func (load-symbol loader (:name (get-package)) fn-info)]
+    (intern *ns* (symbol (name func-name)) func)))
 
 ;; (defn- write-dev-header [referenced-decls]
 ;;   (doseq [decl referenced-decls]
@@ -1475,7 +1512,7 @@ Usage: (dispatch-hook #'hook-map)."
      (map-indexed
       (fn [i line] (println (str i "  " line))) lines))))
 
-(defn do-compile-decls [decls parse-fn]
+(defn- do-compile-decls [decls parse-fn load-fn]
   (let [{:keys [module] :as package} (get-package)]
     (if (dev-mode? module)
       (let [{:keys [compile-ctxt temp-output-path preamble cpp-mode]} module
@@ -1485,12 +1522,11 @@ Usage: (dispatch-hook #'hook-map)."
         (when-let [compiled (compile-decls compile-ctxt decls src)]
           (println body-source)
           (doseq [[n v] compiled] (intern *ns* (symbol (name n)) v))))
-      (let [{:keys [loader]} module]
-        (doseq [[decl-name & forms] decls]
-          (load-symbol loader (:name package) decl-name))))))
+      (doseq [decl decls]
+        (load-fn decl)))))
 
 (defn compile-cfns [funcs]
-  (do-compile-decls funcs #(parse-cfn (get-package) %)))
+  (do-compile-decls funcs #'parse-cfn #'load-cfn))
 
 (defn cdefn* [& forms]
   (compile-cfns [forms]))
@@ -1556,7 +1592,8 @@ Usage: (dispatch-hook #'hook-map)."
         target-type (lookup-type target-type)
         decl (TypeDef. package typedef-name target-type metadata nil)]
     (add-declaration package decl)
-    (write-decl decl)))
+    (when (dev-mode?)
+      (println (write-decl decl)))))
 
 (defmacro ctypedef
   ([target-type typedef-name]
@@ -1613,21 +1650,22 @@ Usage: (dispatch-hook #'hook-map)."
   (get-fields [_])
   (create-field-access-expr [_ instance-expr field-name]))
 
-(defn- cenum* [enum-name values]
-  (let [package (get-package)
-        enum-name (name enum-name)
-        values (partition 2 values)
-        base-type (lookup-type "i32")
-        values (map #(EnumValue. (name (first %))
-                                 (second %)
-                                 base-type
-                                 enum-name)
-                    values)
-        enum (EnumType. package enum-name values)]
-    (add-declaration package enum)
-    (doseq [v values]
-      (add-declaration package v))
-    (println (write-decl enum))))
+(defn cenum* [enum-name values]
+  (when (dev-mode?)
+    (let [package (get-package)
+          enum-name (name enum-name)
+          values (partition 2 values)
+          base-type (lookup-type "i32")
+          values (map #(EnumValue. (name (first %))
+                                   (second %)
+                                   base-type
+                                   enum-name)
+                      values)
+          enum (EnumType. package enum-name values)]
+      (add-declaration package enum)
+      (doseq [v values]
+        (add-declaration package v))
+      (println (write-decl enum)))))
 
 (defmacro cenum [enum-name values]
   (cenum* enum-name values))
@@ -1642,16 +1680,18 @@ Usage: (dispatch-hook #'hook-map)."
 
 (defn cinclude [package-or-include & {:as opts}]
   (let [package (get-package)]
-    (if (satisfies? IPackage package-or-include)
-      (let [referenced-pkg package-or-include
-            decl (PackageIncludeDeclaration. package referenced-pkg opts nil)]
-        (swap! (:referenced-packages (get-package)) conj package-or-include)
-        (add-declaration package decl)
-        decl)
-      (let [include-name package-or-include
-            decl (IncludeDeclaration. package include-name opts nil)]
-        (add-declaration package decl)
-        decl))))
+    (when (satisfies? IPackage package-or-include)
+      (swap! (:referenced-packages (get-package)) conj package-or-include))
+    (when (dev-mode?)
+      (if (satisfies? IPackage package-or-include)
+        (let [referenced-pkg package-or-include
+              decl (PackageIncludeDeclaration. package referenced-pkg opts nil)]
+          (add-declaration package decl)
+          decl)
+        (let [include-name package-or-include
+              decl (IncludeDeclaration. package include-name opts nil)]
+          (add-declaration package decl)
+          decl)))))
 
 (defrecord GlobalVariableDeclaration [package var-name var-type init-expr]
   clojure.lang.Named
@@ -1675,8 +1715,10 @@ Usage: (dispatch-hook #'hook-map)."
     (add-declaration package var-decl)
     var-decl))
 
+(defn- load-cdef [[var-name & _]])
+
 (defn cdef* [& forms]
-  (do-compile-decls [forms] parse-cdef))
+  (do-compile-decls [forms] parse-cdef load-cdef))
 
 (defn write-package-source [{:keys [declarations module] :as package} & {:keys [src-output-path cpp-mode]}]
   (binding [*package* package]
@@ -1735,4 +1777,5 @@ Usage: (dispatch-hook #'hook-map)."
   (decl-package [_] package ))
 
 (defn cheader [raw-header]
-  (add-declaration (get-package) (RawCHeader. (get-package) raw-header)))
+  (when (dev-mode?)
+    (add-declaration (get-package) (RawCHeader. (get-package) raw-header))))
