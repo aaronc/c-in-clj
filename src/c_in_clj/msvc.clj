@@ -131,7 +131,7 @@
                    proc-name (get-proc-name decl)
                    new-fn-ptr (GetProcAddress new-dll-handle proc-name)]
                (when (= IntPtr/Zero new-fn-ptr)
-                 (throw (Exception. (str "Unable to load " proc-name))))
+                 (throw (Exception. (str "Unable to load " proc-name " from " dll-path))))
                (println "Loaded" proc-name "at" new-fn-ptr)
                (let [new-invoker (make-invoker new-fn-ptr decl)]
                  (if-let [{:keys [fn-ptr-ptr cur-fn-ptr cur-dll-info cur-decl invoker] :as sym-ref} (get @compiled-symbols sym-name)]

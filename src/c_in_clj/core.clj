@@ -31,7 +31,8 @@
   (create-field-access-expr
     [this instance-expr field-name]
     [this instance-expr field-name pointer-depth])
-  (dereferenced-type [this]))
+  (dereferenced-type [this])
+  (default-initializer [this]))
 
 (defprotocol IDeclaration
   (write-decl [this])
@@ -259,7 +260,8 @@
 
 (defmacro defhook [hooks hook-name args & body]
   `(do
-     (swap! ~hooks ~(keyword (name hook-name))
+     (swap! ~hooks assoc
+            ~(keyword (name hook-name))
             (fn ~(symbol (name hook-name)) ~args ~@body))
      nil))
 
@@ -295,8 +297,9 @@ Usage: (dispatch-hook hooks)."
 
 (def ^:private ^:dynamic *dynamic-compile-header* nil)
 
-(defn- add-referenced-decl [resolved]
+(defn add-referenced-decl [resolved]
   ;; (println "trying to add ref to" (name resolved)
+  ;;          (type resolved)
   ;;          (satisfies? IDeclaration resolved)
   ;;          *referenced-decls*)
   (when (and (satisfies? IDeclaration resolved) *referenced-decls*)
@@ -315,6 +318,9 @@ Usage: (dispatch-hook hooks)."
   (write [_] (str "((" (write-type target-type) ")" (write expr) ")"))
   (expr-category [_]))
 
+(defn new-default-cast-expression [target-type expr]
+  (DefaultCastExpression. target-type expr))
+
 (defrecord PrimitiveType [type-name]
   clojure.lang.Named
   (getName [_] type-name)
@@ -328,6 +334,14 @@ Usage: (dispatch-hook hooks)."
   (common-denominator-type [_ _])
   (create-explicit-cast-expr [this expr]
     (DefaultCastExpression. this expr)))
+
+(defmulti default-initializer class)
+
+(defmethod default-initializer :default [_])
+
+(defmulti requires-initialization class)
+
+(defmethod requires-initialization :default [_] false)
 
 (defmacro defprimitive [type-name]
   (let [type-name (name type-name)]
@@ -385,6 +399,8 @@ Usage: (dispatch-hook hooks)."
     (create-field-access-expr this instance-expr member-name 1))
   (create-field-access-expr [this instance-expr member-name pointer-depth]
     (create-field-access-expr type instance-expr member-name pointer-depth)))
+
+(defn new-pointer-type [type] (PointerType. type))
 
 (defrecord AnonymousFieldAccessExpression [instance-expr member-name pointer-depth]
   IHasType
@@ -582,13 +598,14 @@ Usage: (dispatch-hook hooks)."
   IExpression
   (expr-category [_])
   (write [_]
-    (str (write-decl-expr (lookup-type var-type) var-name)
-         ;;(when init-expr (str " = " (write init-expr)))
-         )))
+    (let [var-type (lookup-type var-type)]
+      (str (write-decl-expr var-type var-name)
+           (when-let [init (requires-initialization var-type)]
+             (str " = " (default-initializer var-type)))))))
 
 (defn- create-var-decl
   ([var-name var-type]
-      (VariableDeclaration. var-name var-type)))
+     (VariableDeclaration. var-name var-type)))
 
 (defrecord VariableRefExpression [variable]
   IExpression
@@ -657,6 +674,14 @@ Usage: (dispatch-hook hooks)."
           '~symbol-alias
           '~symbol-name))
 
+(defrecord RawCMacro [package macro-name body]
+  clojure.lang.Named
+  (getName [_] macro-name)
+  IDeclaration
+  (write-decl [_] (str "#define " macro-name " " body "\n"))
+  (write-impl [_])
+  (decl-package [_] package))
+
 (defn- cexpand-op-sym [sym args]
   (let [sym-name (name sym)]
     (if-let [alias (@symbol-aliases sym-name)]
@@ -672,8 +697,10 @@ Usage: (dispatch-hook hooks)."
             (cexpand (apply func args))
             (if-let [local-func (get *locals* sym)]
               (AnonymousFunctionCallExpression. (name sym) (map cexpand args))
-              (if (lookup-symbol sym)
-                (FunctionCallExpression. sym (map cexpand args))
+              (if-let [resolved (lookup-symbol sym)]
+                (if (instance? RawCMacro resolved)
+                  (AnonymousFunctionCallExpression. (name sym) (map cexpand args))
+                  (FunctionCallExpression. sym (map cexpand args)))
                 (throw (ArgumentException. (str "Don't know how to handle list symbol " sym)))))))))))
 
 (defn- cexpand-list [[op & args]]
@@ -706,8 +733,10 @@ Usage: (dispatch-hook hooks)."
    (number? form) (cexpand-num form)
    (= Boolean (type form)) (BooleanLiteral. form)
    (string? form) (StringLiteral. form)
-   (symbol? form) (when (lookup-symbol form)
-                    (VariableRefExpression. form))
+   (symbol? form) (when-let [resolved (lookup-symbol form)]
+                    (if (instance? RawCMacro resolved)
+                      (AnonymousVariableRefExpression. (name form))
+                      (VariableRefExpression. form)))
    (keyword? form) (AnonymousVariableRefExpression. (name form))
    (list? form) (cexpand-list form)
    (vector? form) (cexpand-vector form)
@@ -1340,13 +1369,23 @@ Usage: (dispatch-hook hooks)."
 ;; (defmacro cdefn [name ret args & body]
 ;;   (compile-cfn name ret args body))
 
-(defrecord StructField [name type-name bits]
+(defrecord StructField [name field-type bits]
   clojure.lang.Named
   (getName [_] name)
   IHasType
-  (get-type [_] (lookup-type type-name))
+  (get-type [_] (lookup-type field-type))
   IField
   (get-bitfield-width [_] bits))
+
+(defn new-struct-field [name field-type bits]
+  (StructField. name field-type bits))
+
+(defn write-struct-field [field]
+  (str "\t"
+       (write-decl-expr (get-type field)
+                        (name field))
+       (when-let [bits (get-bitfield-width field)]
+         (str ":" bits)) ";\n"))
 
 (defrecord Struct [package struct-name fields field-map]
   clojure.lang.Named
@@ -1377,15 +1416,13 @@ Usage: (dispatch-hook hooks)."
   (write-decl [_]
     (str "typedef struct " struct-name " {\n"
        (str/join
-        (for [field fields]
-          (str "\t"
-               (write-decl-expr (get-type field)
-                                (name field))
-               (when-let [bits (get-bitfield-width field)]
-                 (str ":" bits)) ";\n")))
+        (map write-struct-field fields))
        "} " struct-name ";"))
   (write-impl [_])
   (decl-package [_] package))
+
+(defn new-struct [package struct-name fields field-map]
+  (Struct. package struct-name fields field-map))
 
 (defn cstruct* [struct-name members]
   (let [package (get-package)
@@ -1423,14 +1460,22 @@ Usage: (dispatch-hook hooks)."
   (is-reference-type? [_])
   (is-function-type? [_]))
 
-(defn- parse-fn-params [params]
-  (for [param params]
-    (let [metadata (meta param)
-          param-name (name param)]
-      (if (= param-name "...")
-        (FunctionParameter. param-name (VarArgsType.) metadata nil)
-        (let [param-type (get-var-type-tag metadata)]
-          (FunctionParameter. param-name param-type metadata nil))))))
+(defn parse-fn-params
+  ([params] (parse-fn-params params nil))
+  ([params fn-name]
+     (let [fn-name-ret-type (get-var-type-tag (meta fn-name))
+           params-meta (meta params)
+           ret-type (or (get-var-type-tag params-meta)
+                        fn-name-ret-type)
+            params
+            (for [param params]
+              (let [metadata (meta param)
+                    param-name (name param)]
+                (if (= param-name "...")
+                  (FunctionParameter. param-name (VarArgsType.) metadata nil)
+                  (let [param-type (get-var-type-tag metadata)]
+                    (FunctionParameter. param-name param-type metadata nil)))))]
+        (FunctionType. ret-type params params-meta nil))))
 
 (defn- parse-cfn [[func-name & forms]]
   (let [package (get-package)
@@ -1439,11 +1484,12 @@ Usage: (dispatch-hook hooks)."
         params (if doc-str (second forms) f1)
         body-forms (if doc-str (nnext forms) (next forms))]
     (binding [*referenced-decls* #{}]
-      (let [params (parse-fn-params params)]
+      (let [func-type (parse-fn-params params func-name)
+            params (:params func-type)]
         (binding [*locals* (into {} (for [param params] [(name param) param]))
                   *local-decls* []]
           (let [func-metadata (meta func-name)
-                ret-type (get-var-type-tag func-metadata)
+                ret-type (:return-type func-type)
                 has-return (not (= "void" (name ret-type)))
                 body-forms (or body-forms (when has-return [(ReturnExpression. nil)]))
                 body-statements (vec (remove nil? (doall (map cstatement body-forms)))) 
@@ -1466,7 +1512,6 @@ Usage: (dispatch-hook hooks)."
                                 (assoc func-metadata :doc doc-str)
                                 func-metadata)
                 func-name (name func-name)
-                func-type (FunctionType. ret-type params)
                 func-decl (FunctionDeclaration. package func-name func-type body-block *referenced-decls* *locals* func-metadata nil)]
             (add-declaration package func-decl)
             func-decl))))))
@@ -1615,9 +1660,8 @@ Usage: (dispatch-hook hooks)."
 
 (defmacro ctypedeffn [typedef-name params]
   (let [metadata (meta typedef-name)
-        return-type (lookup-type (:tag metadata))
-        params (parse-fn-params params)
-        func-ptr-type (PointerType. (FunctionType. return-type params))]
+        func-type (parse-fn-params params typedef-name)
+        func-ptr-type (PointerType. func-type)]
     (ctypedef* func-ptr-type typedef-name metadata)))
 
 (defrecord EnumValue [name value base-type enum-type-name]
@@ -1709,19 +1753,22 @@ Usage: (dispatch-hook hooks)."
   clojure.lang.Named
   (getName [_] var-name)
   IHasType
-  (get-type [_] var-type)
+  (get-type [_] (lookup-type var-type))
   IDeclaration
   (write-decl [this]
-    (or (apply-hook :alternate-global-variable-declaration this)
-        (str (or (apply-hook :before-global-variable-declaration this) "extern ") (write-decl-expr var-type var-name) ";")))
-  (write-impl [this] (str (apply-hook :before-global-variable-declaration this) (write-decl-expr var-type var-name) (when init-expr (str " = " (write init-expr))) ";")))
+    (let [var-type (lookup-type var-type)]
+      (or (apply-hook :alternate-global-variable-declaration this)
+          (str (or (apply-hook :before-global-variable-declaration this) "extern ") (write-decl-expr var-type var-name) ";"))))
+  (write-impl [this]
+    (let [var-type (lookup-type var-type)]
+      (str (apply-hook :before-global-variable-declaration this) (write-decl-expr var-type var-name) (when init-expr (str " = " (write init-expr))) ";"))))
 
 (defn- parse-cdef [[var-name init-expr]]
   (let [package (get-package)
         metadata (meta var-name)
         var-name (name var-name)
         tag (get-var-type-tag metadata)
-        var-type (lookup-type tag)
+        var-type tag
         init-expr (when init-expr (cexpand init-expr))
         var-decl (GlobalVariableDeclaration. package var-name var-type init-expr metadata nil)]
     (add-declaration package var-decl)
@@ -1791,3 +1838,9 @@ Usage: (dispatch-hook hooks)."
 (defn cheader [raw-header]
   (when (dev-mode?)
     (add-declaration (get-package) (RawCHeader. (get-package) raw-header))))
+
+(defn cdefine [macro-name body]
+  (when (dev-mode?)
+    (let [raw-macro (RawCMacro. (get-package) macro-name body)]
+      (add-declaration (get-package) raw-macro)
+      (println (write-decl raw-macro)))))
