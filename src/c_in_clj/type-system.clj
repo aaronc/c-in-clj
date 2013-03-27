@@ -8,34 +8,20 @@
 
 (defrecord InterfaceMethodGroup [method-name overload-map])
 
-(defrecord Interface [package interface-name extends method-map vtable-struct interface-field]
+(defrecord Interface [package type-name extends method-map vtable-struct interface-field field-map]
   clojure.lang.Named
-  (getName [_] interface-name)
+  (getName [_] type-name)
   IDeclaration
-  (decl-package [_] package)
   (write-decl [this]
-    (str "typedef struct " interface-name " {\n"
+    (str "typedef struct " type-name " {\n"
         (write-struct-field interface-field) 
-       "} " interface-name ";"))
+       "} " type-name ";"))
   (write-impl [_])
-  IType
-  (write-type [this]
-    (add-referenced-decl this)
-    interface-name)
-  (is-function-type? [_] false)
-  (is-reference-type? [_] false)
-  (write-decl-expr [this var-name]
-    (write-decl-expr this var-name 0))
-  (write-decl-expr [this var-name pointer-depth]
-    (add-referenced-decl this)
-    (str interface-name (apply str (repeat pointer-depth "*"))
-         " " var-name))
-  (create-explicit-cast-expr [this expr]
-    (new-default-cast-expression this expr))
-  (get-fields [this])
-  (create-field-access-expr [this instance-expr field-name]
-    (create-field-access-expr this instance-expr field-name 0))
-  (create-field-access-expr [this instance-expr field-name pointer-depth]))
+  IType)
+
+(derive Interface :c-in-clj.core/Type)
+
+(derive Interface :c-in-clj.core/Struct)
 
 (defn- parse-interface-overload [method-name overload]
   (cond
@@ -65,11 +51,11 @@
   (let [field-name (if single-arity?
                      method-name
                      (str method-name "__" (count (:params fn-type))))]
-    (new-struct-field field-name (new-pointer-type fn-type) nil)))
+    (->StructField field-name (->PointerType fn-type) nil)))
 
 (defn- create-interface-vtable-struct [interface-name extends method-map]
   (let [extends-fields (map #(with-meta
-                               (new-struct-field (str % "_OFFSET")
+                               (->StructField (str % "_OFFSET")
                                                  'size_t nil)
                                {:offset-for %}) extends)
         fields
@@ -85,15 +71,15 @@
                   overload-map))))
         field-map (into {} (for [{:keys [name] :as f} fields]
                              [name f]))
-        struct (new-struct (get-package) (str interface-name "Interface") fields field-map)]
+        struct (->Struct (get-package) (str interface-name "Interface") fields field-map)]
     (add-declaration (get-package) struct)
     (println (write-decl struct))
     struct))
 
 (defn- create-interface-field [vtable-struct]
   (let [name (name vtable-struct)
-        type (new-pointer-type vtable-struct)]
-    (new-struct-field (str "_" name) type nil)))
+        type (->PointerType vtable-struct)]
+    (->StructField (str "_" name) type nil)))
 
 (defn cdefinterface* [interface-name extends methods]
   (when (dev-mode?)
@@ -107,7 +93,7 @@
                                 [(:method-name m) m]))
           vtable-struct (create-interface-vtable-struct interface-name extends method-map)
           interface-field (create-interface-field vtable-struct)
-          interface (Interface. (get-package) interface-name extends method-map vtable-struct interface-field)]
+          interface (Interface. (get-package) interface-name extends method-map vtable-struct interface-field nil)]
       (add-declaration (get-package) interface)
       (println (write-decl interface)))))
 
@@ -132,35 +118,20 @@
 
 (defrecord InterfaceVTable [class-name interface-name fn-map])
 
-(defrecord Class [package class-name base-class interfaces new-interfaces members
-                  vtables]
+(defrecord Class [package type-name base-class interfaces new-interfaces members
+                  vtables field-map]
   clojure.lang.Named
-  (getName [_] class-name)
+  (getName [_] type-name)
   IDeclaration
-  (decl-package [_] package)
   (write-decl [this]
-    (str "typedef struct " class-name " {\n"
+    (str "typedef struct " type-name " {\n"
          (write-class-body this)
-         "} " class-name ";"))
+         "} " type-name ";"))
   (write-impl [_])
-  IType
-  (write-type [this]
-    (add-referenced-decl this)
-    class-name)
-  (is-function-type? [_] false)
-  (is-reference-type? [_] false)
-  (write-decl-expr [this var-name]
-    (write-decl-expr this var-name 0))
-  (write-decl-expr [this var-name pointer-depth]
-    (add-referenced-decl this)
-    (str class-name (apply str (repeat pointer-depth "*"))
-         " " var-name))
-  (create-explicit-cast-expr [this expr]
-    (new-default-cast-expression this expr))
-  (get-fields [this])
-  (create-field-access-expr [this instance-expr field-name]
-    (create-field-access-expr this instance-expr field-name 0))
-  (create-field-access-expr [this instance-expr field-name pointer-depth]))
+  IType)
+
+(derive Class :c-in-clj.core/Type)
+(derive Class :c-in-clj.core/Struct)
 
 (defmethod default-initializer Class [cls] "{}")
 
@@ -204,8 +175,7 @@
   (get-type [_] (lookup-type vtable-struct))
   IExpression
   (write [this]
-    (write-vtable-init vtable-struct interface-vtable))
-  (expr-category [this]))
+    (write-vtable-init vtable-struct interface-vtable)))
 
 (defn cdefclass* [class-name extends members]
   (let [metadata (meta class-name)
@@ -220,7 +190,7 @@
         [new-interfaces interfaces]
         (get-new-all-interfaces base-class interfaces)
         members (for [[type-name field-name bits] members]
-                  (new-struct-field (name field-name) type-name bits))
+                  (->StructField (name field-name) type-name bits))
         vtables (zipmap interfaces (map #(InterfaceVTable. class-name % (atom {}))
                                         interfaces))
         cls (Class. (get-package) class-name base-class interfaces

@@ -7,37 +7,61 @@
 (defprotocol IHasType
   (get-type [this]))
 
+(defmulti expr-category class)
+
+(defmethod expr-category :default [_] nil)
+
 (defprotocol IExpression
-  (write [this])
-  (expr-category [this])
+  (write-expr [this])
   (wrap-last [this func]))
 
-(defprotocol IField
-  (get-bitfield-width [this]))
+(defprotocol IType)
 
-(defprotocol IType
-  (write-type [this])
-  (write-decl-expr
-    [this var-name]
-    [this var-name pointer-depth])
-  (is-reference-type? [this])
-  (is-function-type? [this])
-  (create-new-expr
-    [this args])
-  (common-denominator-type [this other-type])
-  (create-implicit-cast-expr [this expr])
-  (create-explicit-cast-expr [this expr])
-  (get-fields [this])
-  (create-field-access-expr
-    [this instance-expr field-name]
-    [this instance-expr field-name pointer-depth])
-  (dereferenced-type [this])
-  (default-initializer [this]))
+(defmulti write-type class)
+
+(defmethod write-type ::Type [{:keys [type-name]}] type-name)
+
+(defmulti create-explicit-cast-expr (fn [this expr] (class this)))
+
+(defrecord DefaultCastExpression [target-type expr]
+  IHasType
+  (get-type [_] target-type)
+  IExpression
+  (write-expr [_] (str "((" (write-type target-type) ")" (write-expr expr) ")")))
+
+(defmethod create-explicit-cast-expr :default [this expr]
+  (DefaultCastExpression. this expr))
+
+(defmulti is-reference-type? class)
+
+(defmethod is-reference-type? ::Type [_] false)
+
+(defmulti is-function-type? class)
+
+(defmethod is-function-type? ::Type [_] false)
+
+(defmulti get-fields type)
+
+(defmethod get-fields ::Type [_])
+
+(defmulti write-decl-expr (fn [this & args] (class this)))
+
+(defmethod write-decl-expr ::Type
+  ([{:keys [type-name]} var-name] (str type-name " " var-name))
+  ([{:keys [type-name]} var-name pointer-depth]
+     (str type-name (apply str (repeat pointer-depth "*")) " " var-name)))
+
+(defmulti common-denominator-type (fn [this & args] (class this)))
+
+(defmethod common-denominator-type ::Type [_ other-type])
+
+(defmulti create-field-access-expr (fn [this & args] (class this)))
+
+(defmulti dereferenced-type class)
 
 (defprotocol IDeclaration
   (write-decl [this])
-  (write-impl [this])
-  (decl-package [this]))
+  (write-impl [this]))
 
 (defrecord CompileSource [source body-source filename])
 
@@ -311,29 +335,12 @@ Usage: (dispatch-hook hooks)."
           (set! *dynamic-compile-header*
                 (str *dynamic-compile-header* "\n\n" decl-text)))))))
 
-(defrecord DefaultCastExpression [target-type expr]
-  IHasType
-  (get-type [_] target-type)
-  IExpression
-  (write [_] (str "((" (write-type target-type) ")" (write expr) ")"))
-  (expr-category [_]))
-
-(defn new-default-cast-expression [target-type expr]
-  (DefaultCastExpression. target-type expr))
-
 (defrecord PrimitiveType [type-name]
   clojure.lang.Named
   (getName [_] type-name)
-  IType
-  (write-type [_] type-name)
-  (write-decl-expr [_ var-name] (str type-name " " var-name))
-  (write-decl-expr [_ var-name pointer-depth]
-    (str type-name (apply str (repeat pointer-depth "*")) " " var-name))
-  (is-reference-type? [_] false)
-  (is-function-type? [_] false)
-  (common-denominator-type [_ _])
-  (create-explicit-cast-expr [this expr]
-    (DefaultCastExpression. this expr)))
+  IType)
+
+(derive PrimitiveType ::Type)
 
 (defmulti default-initializer class)
 
@@ -380,34 +387,43 @@ Usage: (dispatch-hook hooks)."
 (ctype-alias u32 uint32_t)
 (ctype-alias u64 uint64_t)
 
-(defrecord PointerType [type]
-  clojure.lang.Named
-  (getName [_] (str (name type) "*"))
-  IType
-  (write-type [_] (str (write-type type) "*"))
-  (write-decl-expr [_ var-name]
-    (write-decl-expr type var-name 1))
-  (write-decl-expr [_ var-name pointer-depth]
-    (write-decl-expr type var-name (inc pointer-depth)))
-  (is-function-type? [_]
-    (is-function-type? type))
-  (is-reference-type? [_] true)
-  (get-fields [_])
-  (create-explicit-cast-expr [this expr]
-    (DefaultCastExpression. this expr))
-  (create-field-access-expr [this instance-expr member-name]
-    (create-field-access-expr this instance-expr member-name 1))
-  (create-field-access-expr [this instance-expr member-name pointer-depth]
-    (create-field-access-expr type instance-expr member-name pointer-depth)))
+(declare lookup-type)
 
-(defn new-pointer-type [type] (PointerType. type))
+;; PointerType
+
+(defrecord PointerType [type-name]
+  clojure.lang.Named
+  (getName [_] (str (name type-name) "*"))
+  IType)
+
+(derive PointerType ::Type)
+
+(defmethod write-decl-expr PointerType
+  ([{:keys [type-name]} var-name]
+     (write-decl-expr (lookup-type type-name) var-name 1))
+  ([{:keys [type-name]} var-name pointer-depth]
+     (write-decl-expr (lookup-type type-name) var-name (inc pointer-depth))))
+
+(defmethod is-function-type? PointerType [{:keys [type-name]}]
+  (is-function-type? (lookup-type type-name)))
+
+(defmethod is-reference-type? PointerType [_] true)
+
+(defmethod write-type PointerType
+  [{:keys [type-name]}]
+  (str (write-type type-name) "*"))
+
+(defmethod create-field-access-expr PointerType
+  ([this instance-expr member-name]
+     (create-field-access-expr this instance-expr member-name 1))
+  ([{:keys [type-name]} instance-expr member-name pointer-depth]
+     (create-field-access-expr (lookup-type type-name) instance-expr member-name pointer-depth)))
 
 (defrecord AnonymousFieldAccessExpression [instance-expr member-name pointer-depth]
   IHasType
   (get-type [_])
   IExpression
-  (expr-category [_])
-  (write [_]
+  (write-expr [_]
     (let [prefix-pointer (when (>= pointer-depth 2)
                            (- pointer-depth 2))
           pointer-depth (if prefix-pointer 1
@@ -415,46 +431,58 @@ Usage: (dispatch-hook hooks)."
       (str
        (when prefix-pointer
          (apply str "(" (repeat prefix-pointer "*")))
-       (write instance-expr)
+       (write-expr instance-expr)
        (when prefix-pointer ")")
        (case pointer-depth
          0 "."
          1 "->")
        (name member-name)))))
 
+;; AnonymousType 
+
 (defrecord AnonymousType [type-name]
   clojure.lang.Named
   (getName [_] type-name)
-  IType
-  (write-type [_] type-name)
-  (write-decl-expr [_ var-name] (str type-name " " var-name))
-  (write-decl-expr [_ var-name pointer-depth] (str type-name (apply str (repeat pointer-depth "*")) " " var-name))
-  (is-reference-type? [_])
-  (is-function-type? [_])
-  (create-explicit-cast-expr [this expr]
-    (DefaultCastExpression. this expr))
-  (create-field-access-expr [this instance-expr member-name]
+  IType)
+
+(defmethod create-field-access-expr AnonymousType
+  ([this instance-expr member-name]
     (create-field-access-expr this instance-expr member-name 0))
-  (create-field-access-expr [this instance-expr member-name pointer-depth]
+  ([this instance-expr member-name pointer-depth]
     (AnonymousFieldAccessExpression. instance-expr member-name pointer-depth)))
 
-(defrecord StaticArrayType [underlying-type array-length]
+(derive AnonymousType ::Type)
+
+;; StaticArrayType
+
+(defrecord StaticArrayType [element-type-name array-length]
   clojure.lang.Named
-  (getName [_] (str (name underlying-type) "[" array-length "]"))
-  IType
-  (write-type [_] (str (write-type underlying-type) "[" array-length "]"))
-  (write-decl-expr [_ var-name] (str (write-decl-expr underlying-type var-name)
-                                     "[" array-length "]"))
-  (is-reference-type? [_] true)
-  (is-function-type? [_] false)
-  (dereferenced-type [_] underlying-type))
+  (getName [_] (str element-type-name "[" array-length "]"))
+  IType)
+
+(derive StaticArrayType ::Type)
+
+(defmethod write-decl-expr StaticArrayType
+  [{:keys [element-type-name array-length]} var-name]
+  (str (write-decl-expr (lookup-type element-type-name) var-name)
+       "[" array-length "]"))
+
+(defmethod is-reference-type? StaticArrayType [_] true)
+
+(defmethod write-type StaticArrayType
+  [{:keys [element-type-name array-length]}]
+  (str (write-type (lookup-type element-type-name)) "[" array-length "]"))
+
+(defmethod dereferenced-type StaticArrayType
+  [{:keys [element-type-name]}]
+  (lookup-type element-type-name))
 
 (declare lookup-symbol)
 
 (defn lookup-type [type-name]
   (let [resolved-type
         (cond
-         (satisfies? IType type-name) type-name
+         (isa? type-name ::Type) type-name
          (keyword? type-name) (AnonymousType. (name type-name))
          :default
          (let [type-name (name type-name)]
@@ -472,18 +500,21 @@ Usage: (dispatch-hook hooks)."
                  (if (.EndsWith type-name "*")
                    (PointerType. (lookup-type (.Substring type-name 0 (dec (.Length type-name)))))
                    (when-let [typ (resolve-symbol (get-package) type-name)]
-                     (when (satisfies? IType typ) typ))))))))]
+                     (when (isa? type ::Type) typ))))))))]
     (add-referenced-decl resolved-type)
     resolved-type))
 
+(defmethod expr-category ::Literal [_] :literal)
+
 (defmacro defliteral [name ctype]
   (let [ctype (lookup-type ctype)]
-    `(defrecord ~name [value#]
-       IExpression
-       (write [_] (pr-str value#))
-       (expr-category [_] :literal)
-       IHasType
-       (get-type [_] ~ctype))))
+    `(do
+       (defrecord ~name [value#]
+         IExpression
+         (write-expr [_] (pr-str value#))
+         IHasType
+         (get-type [_] ~ctype))
+       (derive ~name :c-in-clj.core/Literal))))
 
 (defliteral Int32Literal int32_t)
 (defliteral Int64Literal int64_t)
@@ -493,17 +524,21 @@ Usage: (dispatch-hook hooks)."
 
 (defrecord CharLiteral [value]
        IExpression
-       (write [_] (str "'" value "'"))
-       (expr-category [_] :literal)
+       (write-expr [_] (str "'" value "'"))
        IHasType
        (get-type [_] "char"))
 
-(def null-literal
-  (reify IExpression
-    (write [this] "NULL")
-    (expr-category [_] :literal)
-    IHasType
-    (get-type [this])))
+(derive CharLiteral ::Literal)
+
+(defrecord NullLiteral []
+  IExpression
+  (write-expr [this] "NULL")
+  IHasType
+  (get-type [this]))
+
+(derive NullLiteral ::Literal)
+
+(def null-literal (NullLiteral.))
 
 (defrecord FunctionParameter [param-name param-type]
   clojure.lang.Named
@@ -511,33 +546,40 @@ Usage: (dispatch-hook hooks)."
   IHasType
   (get-type [_] (lookup-type param-type))
   IExpression
-  (expr-category [_] :local)
-  (write [_] (write-decl-expr (lookup-type param-type) param-name)))
+  (write-expr [_] (write-decl-expr (lookup-type param-type) param-name)))
+
+(defmethod expr-category FunctionParameter [_] :local)
 
 (defn- write-function-type [{:keys [return-type params]}
                             pointer-depth name?]
   (str (write-type (lookup-type return-type)) " ("
        (apply str (repeat pointer-depth "*"))
        name? ")("
-       (str/join ", " (map write params)) ")"))
+       (str/join ", " (map write-expr params)) ")"))
 
 (defrecord FunctionType [return-type params]
-  IType
-  (write-type [this]
-    (write-function-type this 0 nil))
-  (write-decl-expr [this var-name]
+  IType)
+
+(derive FunctionType ::Type)
+
+(defmethod is-function-type? FunctionType [_] true)
+
+(defmethod write-decl-expr FunctionType
+  ([this var-name]
     (write-function-type this 0 var-name))
-  (write-decl-expr [this var-name pointer-depth]
-    (write-function-type this pointer-depth var-name))
-  (is-reference-type? [this] false)
-  (is-function-type? [_] true))
+  ([this var-name pointer-depth]
+    (write-function-type this pointer-depth var-name)))
+
+(defmethod write-type FunctionType
+  [this]
+  (write-function-type this 0 nil))
 
 (defn- write-function-signature [{:keys [function-name function-type] :as decl} ]
   (let [{:keys [return-type params]} function-type]
     (str
      (apply-hook :before-function-signature decl)
      (write-type (lookup-type return-type)) " "
-     function-name "(" (str/join ", " (map write params)) ")")))
+     function-name "(" (str/join ", " (map write-expr params)) ")")))
 
 (defrecord FunctionDeclaration [package function-name function-type body referenced-decls locals]
   clojure.lang.Named
@@ -556,8 +598,7 @@ Usage: (dispatch-hook hooks)."
   (write-impl [this]
     (str (write-function-signature this) "\n"
          (binding [*locals* locals]
-           (write body))))
-  (decl-package [this] package))
+           (write-expr body)))))
 
 (defmethod print-method FunctionDeclaration [o w]
   (print-simple
@@ -565,28 +606,25 @@ Usage: (dispatch-hook hooks)."
 
 (defrecord FunctionCallExpression [func args]
   IExpression
-  (write [this]
+  (write-expr [this]
     (str (name (lookup-symbol func))
-         "(" (str/join "," (map write args)) ")"))
-  (expr-category [_])
+         "(" (str/join "," (map write-expr args)) ")"))
   IHasType
   (get-type [this] (:return-type (get-type (lookup-symbol func)))))
 
 (defrecord AnonymousFunctionCallExpression [func-name args]
   IExpression
-  (write [this]
+  (write-expr [this]
     (str (name func-name)
-         "(" (str/join "," (map write args)) ")"))
-  (expr-category [_])
+         "(" (str/join "," (map write-expr args)) ")"))
   IHasType
   (get-type [this]))
 
 (defrecord ComputedFunctionCallExpression [func-expr args]
   IExpression
-  (write [this]
-    (str (write func-expr)
-         "(" (str/join "," (map write args)) ")"))
-  (expr-category [_])
+  (write-expr [this]
+    (str (write-expr func-expr)
+         "(" (str/join "," (map write-expr args)) ")"))
   IHasType
   (get-type [this] (get-type func-expr)))
 
@@ -596,8 +634,7 @@ Usage: (dispatch-hook hooks)."
   IHasType
   (get-type [_] (lookup-type var-type))
   IExpression
-  (expr-category [_])
-  (write [_]
+  (write-expr [_]
     (let [var-type (lookup-type var-type)]
       (str (write-decl-expr var-type var-name)
            (when-let [init (requires-initialization var-type)]
@@ -609,15 +646,13 @@ Usage: (dispatch-hook hooks)."
 
 (defrecord VariableRefExpression [variable]
   IExpression
-  (write [_] (name (lookup-symbol variable)))
-  (expr-category [_])
+  (write-expr [_] (name (lookup-symbol variable)))
   IHasType
   (get-type [_] (get-type (lookup-symbol variable))))
 
 (defrecord AnonymousVariableRefExpression [var-name]
   IExpression
-  (write [_] (name var-name))
-  (expr-category [_])
+  (write-expr [_] (name var-name))
   IHasType
   (get-type [_]))
 
@@ -679,8 +714,7 @@ Usage: (dispatch-hook hooks)."
   (getName [_] macro-name)
   IDeclaration
   (write-decl [_] (str "#define " macro-name " " body "\n"))
-  (write-impl [_])
-  (decl-package [_] package))
+  (write-impl [_]))
 
 (defn- cexpand-op-sym [sym args]
   (let [sym-name (name sym)]
@@ -719,8 +753,7 @@ Usage: (dispatch-hook hooks)."
   IHasType
   (get-type [_])
   IExpression
-  (expr-category [_])
-  (write [_] (str "{" (str/join ", " (map write values)) "}")))
+  (write-expr [_] (str "{" (str/join ", " (map write-expr values)) "}")))
 
 (defn- cexpand-vector [values]
   (InitializerList. (map cexpand values)))
@@ -764,7 +797,6 @@ Usage: (dispatch-hook hooks)."
     `(do
       (defrecord ~rec-sym ~args
         IExpression
-        (expr-category [_])
         ~@body)
       (cintrinsic ~sym ~args
                   (new ~rec-sym ~@args)))))
@@ -776,13 +808,13 @@ Usage: (dispatch-hook hooks)."
 
 (defmacro cbinop [sym]
   `(cop ~sym [x# y#]
-        (write [_] (str "(" (write x#) " " ~(name sym) " " (write y#) ")"))
+        (write-expr [_] (str "(" (write-expr x#) " " ~(name sym) " " (write-expr y#) ")"))
         IHasType
         (get-type [_] (get-bin-op-type x# y#))))
 
 (defmacro cbinop* [sym expr]
   `(cop ~sym [x# y#]
-        (write [_] (str "(" (write x#) " " ~expr " " (write y#) ")"))
+        (write-expr [_] (str "(" (write-expr x#) " " ~expr " " (write-expr y#) ")"))
         IHasType
         (get-type [_] (get-bin-op-type x# y#))))
 
@@ -791,7 +823,7 @@ Usage: (dispatch-hook hooks)."
 
 (defmacro compop [sym]
   `(cop ~sym [x# y#]
-        (write [this#] (str "(" (write x#) " " ~(name sym) " " (write y#) ")"))
+        (write-expr [this#] (str "(" (write-expr x#) " " ~(name sym) " " (write-expr y#) ")"))
         IHasType
         (get-type [this#] 'bool)))
 
@@ -800,7 +832,7 @@ Usage: (dispatch-hook hooks)."
 
 (defmacro compop* [sym expr]
   `(cop ~sym [x# y#]
-        (write [this#] (str "(" (write x#) " " ~expr " " (write y#) ")"))
+        (write-expr [this#] (str "(" (write-expr x#) " " ~expr " " (write-expr y#) ")"))
         IHasType
         (get-type [this#] 'bool)))
 
@@ -835,8 +867,7 @@ Usage: (dispatch-hook hooks)."
          IHasType
          (get-type [_])
          IExpression
-         (expr-category [_])
-         (write [this#] (str "(" (write x#) " " ~expr " " (reduce-parens (write y#)) ")")))
+         (write-expr [this#] (str "(" (write-expr x#) " " ~expr " " (reduce-parens (write-expr y#)) ")")))
        (cintrinsic
         ~sym
         [target# source#]
@@ -850,11 +881,10 @@ Usage: (dispatch-hook hooks)."
     `(do
        (defrecord ~rec-sym [~'args]
          IExpression
-         (expr-category [_])
-         (write [_]
+         (write-expr [_]
            (if (= 1 (count ~'args))
-             (str ~(name sym) (write (first ~'args)))
-             (str "(" (str/join ~(str " " sym " ") (map write ~'args)) ")")))
+             (str ~(name sym) (write-expr (first ~'args)))
+             (str "(" (str/join ~(str " " sym " ") (map write-expr ~'args)) ")")))
          IHasType
          (get-type [_] (apply get-bin-op-type ~'args)))
        (cintrinsic* '~sym
@@ -866,9 +896,8 @@ Usage: (dispatch-hook hooks)."
     `(do
        (defrecord ~rec-sym [~'args]
          IExpression
-         (expr-category [_])
-         (write [_]
-           (str "(" (str/join ~(str " " expr " ") (map write ~'args)) ")"))
+         (write-expr [_]
+           (str "(" (str/join ~(str " " expr " ") (map write-expr ~'args)) ")"))
          IHasType
          (get-type [_] (lookup-type 'bool)))
        (cintrinsic* '~sym
@@ -905,7 +934,7 @@ Usage: (dispatch-hook hooks)."
 
 (defmacro cunop [name arg & body]
   `(cop ~name ~arg
-        (write [this#] ~@body)
+        (write-expr [this#] ~@body)
         IHasType
         (get-type [this#] (get-type ~(first arg)))))
 
@@ -913,7 +942,7 @@ Usage: (dispatch-hook hooks)."
   (apply str (for [arg args]
                (if (string? arg)
                  arg
-                 (write arg)))))
+                 (write-expr arg)))))
 
 (cunop inc [x] (write-str "++" x))
 (cunop dec [x] (write-str "--" x))
@@ -922,14 +951,13 @@ Usage: (dispatch-hook hooks)."
 (cunop bit-not [x] (write-str "~" x))
 
 (cop not [x]
-     (write [_] (str "!" (write x)))
+     (write-expr [_] (str "!" (write-expr x)))
      IHasType
      (get-type [_] (lookup-type 'bool)))
 
 (defrecord SizeofExpression [x]
   IExpression
-  (expr-category [_])
-  (write [_] (let [type (lookup-type x)]
+  (write-expr [_] (let [type (lookup-type x)]
                (str "sizeof(" (write-type type) ")")))
   IHasType
   (get-type [_] (lookup-type 'size_t)))
@@ -951,8 +979,7 @@ Usage: (dispatch-hook hooks)."
   IHasType
   (get-type [_] (get-type member-info))
   IExpression
-  (expr-category [_])
-  (write [_]
+  (write-expr [_]
     (let [prefix-pointer (when (>= pointer-depth 2)
                            (- pointer-depth 2))
           pointer-depth (if prefix-pointer 1
@@ -960,7 +987,7 @@ Usage: (dispatch-hook hooks)."
       (str
        (when prefix-pointer
          (apply str "(" (repeat prefix-pointer "*")))
-       (write instance-expr)
+       (write-expr instance-expr)
        (when prefix-pointer ")")
        (case pointer-depth
          0 "."
@@ -985,12 +1012,11 @@ Usage: (dispatch-hook hooks)."
                   IHasType
                   (get-type [_])
                   IExpression
-                  (expr-category [_])
-                  (write [_]
-                    (str/join "->" (map write args)))))))
+                  (write-expr [_]
+                    (str/join "->" (map write-expr args)))))))
 
 (cop aget [x y]
-     (write [_] (write-str x "[" y "]"))
+     (write-expr [_] (write-str x "[" y "]"))
      IHasType
      (get-type [_]
                (lookup-type (dereferenced-type (get-type x)))))
@@ -999,8 +1025,7 @@ Usage: (dispatch-hook hooks)."
   IHasType
   (get-type [_] (get-type target))
   IExpression
-  (expr-category [_])
-  (write [_] (write-str target "[" idx "] = " value)))
+  (write-expr [_] (write-str target "[" idx "] = " value)))
 
 (cintrinsic aset [target idx value]
             (if (is-block? value)
@@ -1008,12 +1033,12 @@ Usage: (dispatch-hook hooks)."
               (ArraySetExpression. target idx value)))
 
 (cop ref [x]
-     (write [_] (write-str "(&" x ")"))
+     (write-expr [_] (write-str "(&" x ")"))
      IHasType
      (get-type [_]))
 
 (cop deref [x]
-     (write [_] (write-str "*" x))
+     (write-expr [_] (write-str "*" x))
      IHasType
      (get-type [_]))
 
@@ -1023,8 +1048,7 @@ Usage: (dispatch-hook hooks)."
   IHasType
   (get-type [_])
   IExpression
-  (expr-category [_])
-  (write [_]
+  (write-expr [_]
     (apply write-str args)))
 
 (cintrinsic* 'c*
@@ -1040,13 +1064,14 @@ Usage: (dispatch-hook hooks)."
 
 (defrecord Statement [expr noindent]
   IExpression
-  (expr-category [_] :statement)
   (wrap-last [_ func]
     (Statement. (func expr) noindent))
-  (write [_]
-    (str (when-not noindent (indent)) (reduce-parens (write expr)) ";"))
+  (write-expr [_]
+    (str (when-not noindent (indent)) (reduce-parens (write-expr expr)) ";"))
   IHasType
   (get-type [_] (get-type expr)))
+
+(defmethod expr-category Statement [_] :statement)
 
 (defn- cstatement [expr & {:keys [noindent]}]
   (let [expr (cexpand expr)]
@@ -1061,13 +1086,14 @@ Usage: (dispatch-hook hooks)."
 
 (defrecord Statements [statements]
   IExpression
-  (expr-category [_] :statement*)
-  (write [_] (str/join "\n" (map write statements)))
+  (write-expr [_] (str/join "\n" (map write-expr statements)))
   (wrap-last [_ func]
     (Statements.
      (wrap-statements func statements)))
   IHasType
   (get-type [_] (get-type (last statements))))
+
+(defmethod expr-category Statements [_] :statement*)
 
 (defn- cstatements [statements]
   (Statements. (doall (map cstatement (remove nil? statements)))))
@@ -1076,17 +1102,16 @@ Usage: (dispatch-hook hooks)."
   IHasType
   (get-type [_])
   IExpression
-  (expr-category [_] :statement*)
-  (write [_]
+  (write-expr [_]
     (let [cases
           (binding [*indent* (inc *indent*)]
             (for [[expr block] cases]
               (if block
                 (let [block (binding [*indent* (inc *indent*)]
-                              (write block))]
-                  (str (indent) "case " (write expr) ":\n" block "\n" (indent) "break;\n"))
-                (str (indent) "default:" (write expr) "\n" (indent) "break;\n"))))]
-      (str "switch(" (write test) ") {\n" (str/join "\n" cases) (indent) "\n}")))
+                              (write-expr block))]
+                  (str (indent) "case " (write-expr expr) ":\n" block "\n" (indent) "break;\n"))
+                (str (indent) "default:" (write-expr expr) "\n" (indent) "break;\n"))))]
+      (str "switch(" (write-expr test) ") {\n" (str/join "\n" cases) (indent) "\n}")))
   (wrap-last [_ func]
     (CaseExpression.
      test
@@ -1094,6 +1119,8 @@ Usage: (dispatch-hook hooks)."
        (if block
          [expr (wrap-last block func)]
          [(wrap-last expr func)])))))
+
+(defmethod expr-category CaseExpression [_] :statement)
 
 (cintrinsic*
  'case
@@ -1115,10 +1142,9 @@ Usage: (dispatch-hook hooks)."
   IHasType
   (get-type [_] (get-type expr))
   IExpression
-  (expr-category [_])
-  (write [_]
+  (write-expr [_]
     (if expr
-      (if-let [expr (write expr)]
+      (if-let [expr (write-expr expr)]
         (str "return " (reduce-parens expr))
         "return")
       "return")))
@@ -1153,19 +1179,20 @@ Usage: (dispatch-hook hooks)."
   IHasType
   (get-type [_])
   IExpression
-  (expr-category [_] :statement*)
-  (write [_]
+  (write-expr [_]
     (str (indent)
-         "if(" (reduce-parens (write expr)) ")\n"
-         (write then)
+         "if(" (reduce-parens (write-expr expr)) ")\n"
+         (write-expr then)
          (when else
            (str "\n" (indent) "else\n"
-                (write else)))))
+                (write-expr else)))))
   (wrap-last [_ func]
     (IfExpression.
      expr
      (wrap-last then func)
      (when else (wrap-last else func)))))
+
+(defmethod expr-category IfExpression [_] :statement*)
 
 (cintrinsic* 'if
              (fn
@@ -1182,22 +1209,22 @@ Usage: (dispatch-hook hooks)."
   IHasType
   (get-type [_] var-type)
   IExpression
-  (write [_] (str (write-decl-expr var-type var-name) "=" (when init-expr (write init-expr))))
-  (expr-category [_]))
+  (write-expr [_] (str (write-decl-expr var-type var-name) "=" (when init-expr (write-expr init-expr)))))
 
 (defrecord BlockExpression [statements]
   IHasType
   (get-type [_] (get-type (last statements)))
   IExpression
-  (expr-category [_] :block)
   (wrap-last [_ func]
     (BlockExpression.
      (wrap-statements func statements)))
-  (write [_]
+  (write-expr [_]
     (str (indent) "{\n"
        (binding [*indent* (inc *indent*)]
-         (str/join "\n" (map write statements)))
+         (str/join "\n" (map write-expr statements)))
        "\n" (indent) "}")))
+
+(defmethod expr-category BlockExpression [_] :block)
 
 (defn- cblock [& statements]
   (BlockExpression. (doall (map cstatement (remove nil? statements)))))
@@ -1208,28 +1235,29 @@ Usage: (dispatch-hook hooks)."
     IHasType
     (get-type [_])
     IExpression
-    (expr-category [_] :statement)
-    (write [_]
+    (write-expr [_]
       (str (indent) "for("
-           (reduce-parens (write init-expr)) "; "
-           (reduce-parens (write test-expr)) "; "
-           (reduce-parens (write each-expr)) ")\n"
-           (write body)))
+           (reduce-parens (write-expr init-expr)) "; "
+           (reduce-parens (write-expr test-expr)) "; "
+           (reduce-parens (write-expr each-expr)) ")\n"
+           (write-expr body)))
     (wrap-last [_ func] (throw (Exception. "Cannot take value of for statement"))))
+
+(defmethod expr-category ForStatement [_] :statement)
 
 (defrecord CommaExpression [expressions]
   IHasType
   (get-type [_])
   IExpression
-  (expr-category [_] :noreturn)
-  (write [_] (str/join ", " (map write expressions))))
+  (write-expr [_] (str/join ", " (map write-expr expressions))))
+
+(defmethod expr-category CommaExpression [_] :statement)
 
 (defrecord NopExpression []
   IHasType
   (get-type [_])
   IExpression
-  (write [_])
-  (expr-category [_]))
+  (write-expr [_]))
 
 (defn- wrap-for-expressions [form]
   (cond
@@ -1253,11 +1281,12 @@ Usage: (dispatch-hook hooks)."
     IHasType
     (get-type [_])
     IExpression
-    (expr-category [_] :statement)
-    (write [_]
-      (str (indent) "while(" (reduce-parens (write test-expr)) ")\n"
-           (write body)))
+    (write-expr [_]
+      (str (indent) "while(" (reduce-parens (write-expr test-expr)) ")\n"
+           (write-expr body)))
     (wrap-last [_ func] (throw (Exception. "Cannot take value of while statement"))))
+
+(defmethod expr-category WhileStatement [_] :statement)
 
 (cintrinsic* 'while
              (fn [test & body]
@@ -1271,8 +1300,7 @@ Usage: (dispatch-hook hooks)."
   IHasType
   (get-type [_])
   IExpression
-  (write [_] "break")
-  (expr-category [_]))
+  (write-expr [_] "break"))
 
 (cintrinsic break [] (BreakStatement.))
 
@@ -1280,8 +1308,7 @@ Usage: (dispatch-hook hooks)."
   IHasType
   (get-type [_])
   IExpression
-  (write [_] "continue")
-  (expr-category [_]))
+  (write-expr [_] "continue"))
 
 (cintrinsic continue [] (ContinueStatement.))
 
@@ -1289,8 +1316,9 @@ Usage: (dispatch-hook hooks)."
   IHasType
   (get-type [_])
   IExpression
-  (write [_] (str (name label) ":"))
-  (expr-category [_] :statement))
+  (write-expr [_] (str (name label) ":")))
+
+(defmethod expr-category LabelStatement [_] :statement)
 
 (cintrinsic* 'label (fn [x] (LabelStatement. x)))
 
@@ -1298,8 +1326,7 @@ Usage: (dispatch-hook hooks)."
   IHasType
   (get-type [_])
   IExpression
-  (write [_] (str "goto " (name label)))
-  (expr-category [_]))
+  (write-expr [_] (str "goto " (name label))))
 
 (cintrinsic* 'goto (fn [x] (GotoExpression. x)))
 
@@ -1373,56 +1400,41 @@ Usage: (dispatch-hook hooks)."
   clojure.lang.Named
   (getName [_] name)
   IHasType
-  (get-type [_] (lookup-type field-type))
-  IField
-  (get-bitfield-width [_] bits))
-
-(defn new-struct-field [name field-type bits]
-  (StructField. name field-type bits))
+  (get-type [_] (lookup-type field-type)))
 
 (defn write-struct-field [field]
   (str "\t"
        (write-decl-expr (get-type field)
                         (name field))
-       (when-let [bits (get-bitfield-width field)]
+       (when-let [bits (:bits field)]
          (str ":" bits)) ";\n"))
 
-(defrecord Struct [package struct-name fields field-map]
+(defrecord Struct [package type-name fields field-map]
   clojure.lang.Named
-  (getName [_] struct-name)
+  (getName [_] type-name)
   IHasType
   (get-type [this] this)
   IType
-  (write-type [this]
-    (add-referenced-decl this)
-    struct-name)
-  (is-function-type? [_] false)
-  (is-reference-type? [_] false)
-  (write-decl-expr [this var-name]
-    (write-decl-expr this var-name 0))
-  (write-decl-expr [this var-name pointer-depth]
-    (add-referenced-decl this)
-    (str struct-name (apply str (repeat pointer-depth "*"))
-         " " var-name))
-  (create-explicit-cast-expr [this expr]
-    (DefaultCastExpression. this expr))
-  (get-fields [this] field-map)
-  (create-field-access-expr [this instance-expr field-name]
-    (create-field-access-expr this instance-expr field-name 0))
-  (create-field-access-expr [this instance-expr field-name pointer-depth]
-    (when-let [field (get field-map (name field-name))]
-      (StructFieldAccessExpression. instance-expr field pointer-depth)))
   IDeclaration
   (write-decl [_]
-    (str "typedef struct " struct-name " {\n"
+    (str "typedef struct " type-name " {\n"
        (str/join
         (map write-struct-field fields))
-       "} " struct-name ";"))
-  (write-impl [_])
-  (decl-package [_] package))
+       "} " type-name ";"))
+  (write-impl [_]))
 
-(defn new-struct [package struct-name fields field-map]
-  (Struct. package struct-name fields field-map))
+(derive Struct ::Type)
+(derive Struct ::Struct)
+
+(defmethod get-fields ::Struct [{:keys [field-map]}] field-map)
+
+(defmethod create-field-access-expr ::Struct
+  create-field-access-expr-struct
+  ([this instance-expr field-name]
+     (create-field-access-expr this instance-expr field-name 0))
+  ([{:keys [field-map]} instance-expr field-name pointer-depth]
+   (when-let [field (get field-map (name field-name))]
+     (StructFieldAccessExpression. instance-expr field pointer-depth)))) 
 
 (defn cstruct* [struct-name members]
   (let [package (get-package)
@@ -1451,14 +1463,19 @@ Usage: (dispatch-hook hooks)."
          expr (cexpand expr)]
      (create-explicit-cast-expr target-type expr))))
 
+;; VarArgsType
+
 (defrecord VarArgsType []
   clojure.lang.Named
   (getName [_] "...")
-  IType
-  (write-type [_])
-  (write-decl-expr [_ var-name] "...")
-  (is-reference-type? [_])
-  (is-function-type? [_]))
+  IType)
+
+(derive VarArgsType ::Type)
+
+(defmethod write-decl-expr VarArgsType
+  [_ var-name] "...")
+
+(defmethod write-type VarArgsType[_])
 
 (defn parse-fn-params
   ([params] (parse-fn-params params nil))
@@ -1536,7 +1553,6 @@ Usage: (dispatch-hook hooks)."
   clojure.lang.Named
   (getName [_] include-name)
   IDeclaration
-  (decl-package [_] package)
   (write-decl [_] (str "#include <" include-name ">"))
   (write-impl [_]))
 
@@ -1613,35 +1629,33 @@ Usage: (dispatch-hook hooks)."
       (symbol (name form))
       form)))
 
-(defrecord TypeDef [package typedef-name target-type]
+;; TypeDef's
+
+(defrecord TypeDef [package type-name target-type]
   clojure.lang.Named
-  (getName [_] typedef-name)
+  (getName [_] type-name)
   IHasType
   (get-type [_] target-type)
   IDeclaration
-  (write-decl [_] (str "typedef " (write-decl-expr target-type typedef-name) ";"))
+  (write-decl [_] (str "typedef " (write-decl-expr target-type type-name) ";"))
   (write-impl [_])
-  (decl-package [_] package)
-  IType
-  (write-type [this]
-    (add-referenced-decl this)
-    typedef-name)
-  (write-decl-expr
-    [this var-name] (write-decl-expr this var-name 0))
-  (write-decl-expr
-    [this var-name pointer-depth]
-    (add-referenced-decl this)
-    (str typedef-name (apply str (repeat pointer-depth "*"))
-         " " var-name))
-  (is-reference-type? [_] (is-reference-type? target-type))
-  (is-function-type? [_] (is-function-type? target-type))
-  (common-denominator-type [_ other-type]
-    (common-denominator-type target-type other-type))
-  (get-fields [_] (get-fields target-type))
-  (create-field-access-expr [_ instance-expr field-name]
-    (create-field-access-expr target-type instance-expr field-name))
-  (create-explicit-cast-expr [this expr]
-    (DefaultCastExpression. this expr)))
+  IType)
+
+(derive TypeDef ::Type)
+
+(defmethod is-reference-type? TypeDef [{:keys [target-type]}] (is-reference-type? target-type))
+
+(defmethod is-function-type? TypeDef [{:keys [target-type]}] (is-function-type? target-type))
+
+(defmethod get-fields TypeDef [{:keys [target-type]}] (get-fields target-type))
+
+(defmethod common-denominator-type TypeDef
+  [{:keys [target-type]} other-type]
+  (common-denominator-type target-type other-type))
+
+(defmethod create-field-access-expr TypeDef
+  [{:keys [target-type]} instance-expr field-name]
+  (create-field-access-expr target-type instance-expr field-name))
 
 (defn ctypedef* [target-type typedef-name metadata]
   (let [package (get-package)
@@ -1664,6 +1678,8 @@ Usage: (dispatch-hook hooks)."
         func-ptr-type (PointerType. func-type)]
     (ctypedef* func-ptr-type typedef-name metadata)))
 
+;; Enums
+
 (defrecord EnumValue [name value base-type enum-type-name]
   clojure.lang.Named
   (getName [_]
@@ -1672,39 +1688,24 @@ Usage: (dispatch-hook hooks)."
   IHasType
   (get-type [_] base-type)
   IExpression
-  (expr-category [_])
-  (write [_]
+  (write-expr [_]
     (lookup-type enum-type-name)
     name))
 
-(defrecord EnumType [package enum-name values]
+(defrecord EnumType [package type-name values]
   clojure.lang.Named
-  (getName [_] enum-name)
+  (getName [_] type-name)
   IDeclaration
   (write-decl [_] (str "typedef enum " 
                        "{"
                        (str/join
                         ", "
                         (map #(str (:name %) " = " (:value %)) values))
-                       "} " enum-name ";"))
+                       "} " type-name ";"))
   (write-impl [_])
-  (decl-package [_] package)
-  IType
-  (write-type [this]
-    (add-referenced-decl this)
-    enum-name)
-  (write-decl-expr
-    [this var-name] (write-decl-expr this var-name 0))
-  (write-decl-expr
-    [this var-name pointer-depth]
-    (add-referenced-decl this)
-    (str enum-name (apply str (repeat pointer-depth "*"))
-         " " var-name))
-  (is-reference-type? [_] false)
-  (is-function-type? [_] false)
-  (common-denominator-type [_ other-type])
-  (get-fields [_])
-  (create-field-access-expr [_ instance-expr field-name]))
+  IType)
+
+(derive EnumType ::Type)
 
 (defn cenum* [enum-name values]
   (when (dev-mode?)
@@ -1726,11 +1727,12 @@ Usage: (dispatch-hook hooks)."
 (defmacro cenum [enum-name values]
   (cenum* enum-name values))
 
+;; Includes
+
 (defrecord PackageIncludeDeclaration [package referenced-package]
   clojure.lang.Named
   (getName [_] (str (name referenced-package) ".h"))
   IDeclaration
-  (decl-package [_] package)
   (write-decl [_] (str "#include \"" (name referenced-package) ".h\""))
   (write-impl [_]))
 
@@ -1761,7 +1763,7 @@ Usage: (dispatch-hook hooks)."
           (str (or (apply-hook :before-global-variable-declaration this) "extern ") (write-decl-expr var-type var-name) ";"))))
   (write-impl [this]
     (let [var-type (lookup-type var-type)]
-      (str (apply-hook :before-global-variable-declaration this) (write-decl-expr var-type var-name) (when init-expr (str " = " (write init-expr))) ";"))))
+      (str (apply-hook :before-global-variable-declaration this) (write-decl-expr var-type var-name) (when init-expr (str " = " (write-expr init-expr))) ";"))))
 
 (defn- parse-cdef [[var-name init-expr]]
   (let [package (get-package)
@@ -1832,8 +1834,7 @@ Usage: (dispatch-hook hooks)."
   (getName [_])
   IDeclaration
   (write-decl [_] (str txt "\n"))
-  (write-impl [_])
-  (decl-package [_] package ))
+  (write-impl [_]))
 
 (defn cheader [raw-header]
   (when (dev-mode?)
