@@ -245,17 +245,29 @@
     (defmacro ~name
       {:hook-map hook-map#}
       [hook-name# args# & body#]
-      (swap! hook-map# assoc
+      `(swap! hook-map# assoc
              hook-name#
-             (eval
-              `(fn ~(symbol (name hook-name#)) ~args#
-                 ~@body#))))))
+             (fn ~(symbol (name hook-name#)) ~args#
+               ~@body#)))))
+
+(defmacro defhooks [name]
+  `(def ~name (atom {})))
+
+(defn add-hook [hooks hook-name hook-func]
+  (swap! hooks assoc (keyword (name hook-name)) hook-func)
+  nil)
+
+(defmacro defhook [hooks hook-name args & body]
+  `(do
+     (swap! ~hooks ~(keyword (name hook-name))
+            (fn ~(symbol (name hook-name)) ~args ~@body))
+     nil))
 
 (defn dispatch-hook
   "Dispatches a hook to a hook map defined with defhooks.
-Usage: (dispatch-hook #'hook-map)."
+Usage: (dispatch-hook hooks)."
   [hooks hook-name ctxt expr]
-  (when-let [hook-impl (get @(:hook-map (meta hooks)) hook-name)]
+  (when-let [hook-impl (get @hooks hook-name)]
     (hook-impl ctxt expr)))
 
 (defn dev-mode?

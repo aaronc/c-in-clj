@@ -173,20 +173,23 @@
             (for [sym-ref sym-refs]
               [(:symbol-name sym-ref) @(:invoker sym-ref)])))))
 
-(defhooks msvc-hook)
+(defhooks msvc-hooks)
 
-(msvc-hook
- :before-function-signature
+(defhook
+  msvc-hooks
+  before-function-signature
  [{:keys [cpp-mode]} expr]
  (str (when cpp-mode "extern \"C\" ") "__declspec(dllexport) "))
 
-(msvc-hook
- :before-global-variable-declaration
- [{:keys [cpp-mode]} expr]
- (str (when cpp-mode "extern \"C\" ") "__declspec(dllexport) "))
+(defhook
+  msvc-hooks
+  before-global-variable-declaration
+  [{:keys [cpp-mode]} expr]
+  (str (when cpp-mode "extern \"C\" ") "__declspec(dllexport) "))
 
-(msvc-hook
- :alternate-function-declaration
+(defhook
+ msvc-hooks
+ alternate-function-declaration
  [{:keys [compiled-symbols]} decl]
  (when *dynamic-compile*
    (let [sym-name (name decl)
@@ -194,8 +197,9 @@
          fn-type (get-type decl)]
      (str "#define " sym-name " (*(" (write-decl-expr fn-type "" 2) ")" fn-ptr-ptr ")"))))
 
-(msvc-hook
- :alternate-global-variable-declaration
+(defhook
+ msvc-hooks
+ alternate-global-variable-declaration
  [{:keys [compiled-symbols]} decl]
  (when *dynamic-compile*
    (let [sym-name (name decl)
@@ -204,7 +208,7 @@
      (str "#define " sym-name " (**(" (write-decl-expr fn-type "" 2) ")" fn-ptr-ptr ")"))))
 
 (defn- msvc-write-hook [ctxt hook-name expr]
-  (dispatch-hook #'msvc-hook hook-name ctxt expr))
+  (dispatch-hook msvc-hooks hook-name ctxt expr))
 
 (defrecord MSVCCompileContext [compiled-symbols dll-handles]
   ICompileContext
