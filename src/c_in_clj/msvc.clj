@@ -3,7 +3,7 @@
            [System.IO Path File Directory]
            [System.Runtime.InteropServices Marshal GCHandle GCHandleType])
   (:require [clojure.string :as str])
-  (:use [c-in-clj.core]
+  (:use [c-in-clj.lang]
         [clojure.clr pinvoke emit]))
 
 (dllimports "kernel32.dll"

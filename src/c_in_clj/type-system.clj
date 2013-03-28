@@ -1,5 +1,6 @@
 (ns c-in-clj.type-system
   (:use [c-in-clj.core]
+        [c-in-clj.lang]
         [c-in-clj.msvc])
   (:require [clojure.string :as str]
             [clojure.set :as set]))
@@ -174,7 +175,7 @@
   IHasType
   (get-type [_] (lookup-type vtable-struct))
   IExpression
-  (write [this]
+  (write-expr [this]
     (write-vtable-init vtable-struct interface-vtable)))
 
 (defn cdefclass* [class-name extends members]
@@ -194,7 +195,7 @@
         vtables (zipmap interfaces (map #(InterfaceVTable. class-name % (atom {}))
                                         interfaces))
         cls (Class. (get-package) class-name base-class interfaces
-                    new-interfaces members vtables metadata nil)]
+                    new-interfaces members vtables nil metadata nil)]
     (add-declaration (get-package) cls)
     (doseq [{:keys [interface-name interface-field vtable-struct] :as iface} (map lookup-type interfaces)]
       (let [vtable (get vtables interface-name)]
