@@ -40,7 +40,7 @@
 
 (defmethod is-function-type? ::Type [_] false)
 
-(defmulti get-fields type)
+(defmulti get-fields class)
 
 (defmethod get-fields ::Type [_])
 
@@ -50,6 +50,8 @@
   ([{:keys [type-name]} var-name] (str type-name " " var-name))
   ([{:keys [type-name]} var-name pointer-depth]
      (str type-name (apply str (repeat pointer-depth "*")) " " var-name)))
+
+(defmulti expand-list-args (fn [this args & opts] (class this)))
 
 (defmulti common-denominator-type (fn [this & args] (class this)))
 
@@ -411,7 +413,7 @@ Usage: (dispatch-hook hooks)."
 
 (defmethod write-type PointerType
   [{:keys [type-name]}]
-  (str (write-type type-name) "*"))
+  (str (write-type (lookup-type type-name)) "*"))
 
 (defmethod create-field-access-expr PointerType
   ([this instance-expr member-name]
@@ -479,32 +481,38 @@ Usage: (dispatch-hook hooks)."
 
 (declare lookup-symbol)
 
+(declare lookup-type)
+
+(defn- static-array-type? [type-name]
+  (when-let [[_ type-name array-len] (re-matches #"(.*)!([0-9]*)" type-name)]
+    (let [underlying-type (lookup-type type-name)
+          array-len (when-not (empty? array-len)
+                      (int array-len))]
+      (if array-len
+        (StaticArrayType. underlying-type array-len)
+        (PointerType. underlying-type)))))
+
 (defn lookup-type [type-name]
   (let [resolved-type
         (cond
-         (isa? type-name ::Type) type-name
+         (isa? (type type-name) ::Type) type-name
          (keyword? type-name) (AnonymousType. (name type-name))
          :default
          (let [type-name (name type-name)]
-           (if-let [[_ type-name array-len] (re-matches #"(.*)!([0-9]*)" type-name)]
-             (let [underlying-type (lookup-type type-name)
-                   array-len (when-not (empty? array-len)
-                               (int array-len))]
-               (if array-len
-                 (StaticArrayType. underlying-type array-len)
-                 (PointerType. underlying-type)))
-             (if-let [primitive (get @primitive-types type-name)]
-               primitive
-               (if-let [alias (get @type-aliases type-name)]
-                 (lookup-type alias)
-                 (if (.EndsWith type-name "*")
-                   (PointerType. (lookup-type (.Substring type-name 0 (dec (.Length type-name)))))
-                   (when-let [typ (resolve-symbol (get-package) type-name)]
-                     (when (isa? type ::Type) typ))))))))]
+           (or
+            (static-array-type? type-name)
+            (if-let [primitive (get @primitive-types type-name)]
+              primitive
+              (if-let [alias (get @type-aliases type-name)]
+                (lookup-type alias)
+                (if (= (last type-name) \*)
+                  (PointerType. (lookup-type (subs type-name 0 (dec (count type-name)))))
+                  (when-let [typ (resolve-symbol (get-package) type-name)]
+                    (when (isa? (type typ) ::Type) typ))))))))]
     (add-referenced-decl resolved-type)
     resolved-type))
 
-(defmethod expr-category ::Literal [_] :literal)
+(declare cexpand)
 
 (defmacro defliteral [name ctype]
   (let [ctype (lookup-type ctype)]
@@ -515,6 +523,8 @@ Usage: (dispatch-hook hooks)."
          IHasType
          (get-type [_] ~ctype))
        (derive ~name :c-in-clj.core/Literal))))
+
+(defmethod expr-category ::Literal [_] :literal)
 
 (defliteral Int32Literal int32_t)
 (defliteral Int64Literal int64_t)
@@ -557,7 +567,9 @@ Usage: (dispatch-hook hooks)."
        name? ")("
        (str/join ", " (map write-expr params)) ")"))
 
-(defrecord FunctionType [return-type params]
+(defrecord FunctionType [type-name return-type params]
+  clojure.lang.Named
+  (getName [_] type-name)
   IType)
 
 (derive FunctionType ::Type)
@@ -600,10 +612,6 @@ Usage: (dispatch-hook hooks)."
          (binding [*locals* locals]
            (write-expr body)))))
 
-(defmethod print-method FunctionDeclaration [o w]
-  (print-simple
-   (str "#" o (into {} (update-in o [:referenced-decls] #(map name %)))) w))
-
 (defrecord FunctionCallExpression [func args]
   IExpression
   (write-expr [this]
@@ -611,6 +619,14 @@ Usage: (dispatch-hook hooks)."
          "(" (str/join "," (map write-expr args)) ")"))
   IHasType
   (get-type [this] (:return-type (get-type (lookup-symbol func)))))
+
+(defmethod expand-list-args FunctionDeclaration
+  [func args]
+  (FunctionCallExpression. (name func) (map cexpand args)))
+
+(defmethod print-method FunctionDeclaration [o w]
+  (print-simple
+   (str "#" o (into {} (update-in o [:referenced-decls] #(map name %)))) w))
 
 (defrecord AnonymousFunctionCallExpression [func-name args]
   IExpression
@@ -656,8 +672,6 @@ Usage: (dispatch-hook hooks)."
   IHasType
   (get-type [_]))
 
-(declare cexpand)
-
 (defn- cexpand-num [x]
   (let [ntype (type x)]
     (cond
@@ -683,6 +697,10 @@ Usage: (dispatch-hook hooks)."
   clojure.lang.Named
   (getName [_] name))
 
+(defmethod expand-list-args CMacro
+  [{:keys [func]} args]
+  (apply func args))
+
 (defn cmacro* [macro-name func]
   (when (dev-mode?)
     (let [macro (CMacro. macro-name func)]
@@ -695,11 +713,6 @@ Usage: (dispatch-hook hooks)."
            (fn ~(symbol (str macro-name "-macro")) ~params
              (unqualify-symbols (do ~@body)))]
        (c-in-clj.core/cmacro* ~(name macro-name) func#))))
-
-(defn lookup-macro [macro-name]
-  (let [macro? (lookup-symbol macro-name)]
-    (when (instance? CMacro macro?)
-      macro?)))
 
 (def ^:private cintrinsics (atom {}))
 
@@ -716,26 +729,53 @@ Usage: (dispatch-hook hooks)."
   (write-decl [_] (str "#define " macro-name " " body "\n"))
   (write-impl [_]))
 
+(defmethod expand-list-args RawCMacro
+  [{:keys [macro-name]} args]
+  (AnonymousFunctionCallExpression. macro-name (map cexpand args)))
+
+;; List Symbol Expansion
+
+(declare cexpand-op-sym)
+
+;; TODO remove alias, macro distinction
+
+(defn- op-sym-alias? [sym args]
+  (when-let [alias (@symbol-aliases sym)]
+    (cexpand-op-sym alias args)))
+
+(defn ^:dynamic lookup-intrinsic [sym]
+  (@cintrinsics sym))
+
+(defn- op-sym-intrinsic? [sym args]
+  (when-let [intrinsic (lookup-intrinsic sym)]
+    (apply intrinsic args)))
+
+(defn- op-sym-member-access? [sym args]
+  (when-let [[_ member] (re-matches #"\.(.*)" sym)]
+    (cexpand-op-sym
+     '.
+     (apply vector
+            (first args)
+            member
+            (rest args)))))
+
+(defn- op-sym-local-func? [sym args]
+  (when-let [local-func (get *locals* sym)]
+    (AnonymousFunctionCallExpression. (name sym) (map cexpand args))))
+
+(defn- op-sym-defined-symbol? [sym args]
+  (when-let [resolved (lookup-symbol sym)]
+    (cexpand (expand-list-args resolved args))))
+
 (defn- cexpand-op-sym [sym args]
   (let [sym-name (name sym)]
-    (if-let [alias (@symbol-aliases sym-name)]
-      (cexpand-op-sym alias)
-      (if-let [intrinsic (@cintrinsics sym)]
-        (apply intrinsic args)
-        (if (.StartsWith sym-name ".") ;; Member access
-          (cexpand-op-sym '. (apply vector
-                                    (first args)
-                                    (.Substring sym-name 1)
-                                    (rest args)))
-          (if-let [{:keys [func]} (lookup-macro sym)]
-            (cexpand (apply func args))
-            (if-let [local-func (get *locals* sym)]
-              (AnonymousFunctionCallExpression. (name sym) (map cexpand args))
-              (if-let [resolved (lookup-symbol sym)]
-                (if (instance? RawCMacro resolved)
-                  (AnonymousFunctionCallExpression. (name sym) (map cexpand args))
-                  (FunctionCallExpression. sym (map cexpand args)))
-                (throw (ArgumentException. (str "Don't know how to handle list symbol " sym)))))))))))
+    (or
+     (op-sym-alias? sym args)
+     (op-sym-intrinsic? sym args)
+     (op-sym-member-access? sym-name args)
+     (op-sym-local-func? sym args)
+     (op-sym-defined-symbol? sym-name args)
+     (throw (ArgumentException. (str "Don't know how to handle list symbol " sym))))))
 
 (defn- cexpand-list [[op & args]]
   (cond
@@ -758,13 +798,14 @@ Usage: (dispatch-hook hooks)."
 (defn- cexpand-vector [values]
   (InitializerList. (map cexpand values)))
 
-(defn- cexpand [form]
+(defn- boolean? [x] (or (= x true) (= x false)))
+
+(defn ^:dynamic cexpand [form]
   (cond
-   (satisfies? IExpression form) form
    (nil? form) null-literal
    (char? form) (CharLiteral. form)
    (number? form) (cexpand-num form)
-   (= Boolean (type form)) (BooleanLiteral. form)
+   (boolean? form) (BooleanLiteral. form)
    (string? form) (StringLiteral. form)
    (symbol? form) (when-let [resolved (lookup-symbol form)]
                     (if (instance? RawCMacro resolved)
@@ -773,6 +814,7 @@ Usage: (dispatch-hook hooks)."
    (keyword? form) (AnonymousVariableRefExpression. (name form))
    (list? form) (cexpand-list form)
    (vector? form) (cexpand-vector form)
+   (satisfies? IExpression form) form
    :default (throw (ArgumentException. (str "Don't know how to handle " form " of type " (type form))))))
 
 (defn- is-block? [expr]
@@ -782,7 +824,7 @@ Usage: (dispatch-hook hooks)."
 (defn- cintrinsic* [sym func]
   (swap! cintrinsics assoc sym func))
 
-(defmacro cintrinsic [sym args & body]
+(defmacro ^:private cintrinsic [sym args & body]
   `(cintrinsic* '~sym
                (fn ~sym ~args
                  (let [~@ (doall (reduce (fn [res x] (into res [x `(cexpand ~x)])) [] args))]
@@ -838,8 +880,8 @@ Usage: (dispatch-hook hooks)."
 
 (defn- reduce-parens [^String expr]
   (when expr
-    (if (.StartsWith expr "(")
-      (let [len (.Length expr)
+    (if (= (first expr) \()
+      (let [len (count expr)
             matching-paren-idx
             (loop [idx 1
                    depth 1]
@@ -855,7 +897,7 @@ Usage: (dispatch-hook hooks)."
                    :default
                    (recur (inc idx) depth)))))]
         (if (= matching-paren-idx (- len 1))
-          (.Substring expr 1 (- len 2))
+          (subs expr 1 (- len 1))
           expr))
       expr)))
 
@@ -1372,7 +1414,7 @@ Usage: (dispatch-hook hooks)."
     (do
       (add-local
        (create-var-decl (name sym) decl-type))
-      nil)
+      (NopExpression.))
      (throw (ArgumentException.
              (str "Unable to infer type for declare expression of symbol" sym)))))
 
@@ -1492,7 +1534,7 @@ Usage: (dispatch-hook hooks)."
                   (FunctionParameter. param-name (VarArgsType.) metadata nil)
                   (let [param-type (get-var-type-tag metadata)]
                     (FunctionParameter. param-name param-type metadata nil)))))]
-        (FunctionType. ret-type params params-meta nil))))
+       (FunctionType. (name fn-name) ret-type params params-meta nil))))
 
 (defn- parse-cfn [[func-name & forms]]
   (let [package (get-package)
@@ -1764,6 +1806,10 @@ Usage: (dispatch-hook hooks)."
   (write-impl [this]
     (let [var-type (lookup-type var-type)]
       (str (apply-hook :before-global-variable-declaration this) (write-decl-expr var-type var-name) (when init-expr (str " = " (write-expr init-expr))) ";"))))
+
+(defmethod expand-list-args GlobalVariableDeclaration
+  [{:keys [var-name]} args]
+  (FunctionCallExpression. var-name (map cexpand args)))
 
 (defn- parse-cdef [[var-name init-expr]]
   (let [package (get-package)
