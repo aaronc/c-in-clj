@@ -1,30 +1,82 @@
 * c-in-clj
 
-Generate dynamically load pure C code from Clojure s-expressions.
-Work in progress, not ready to use.
+A Clojure DSL for generating C code and dynamically loading (and
+reloading) it from the Clojure REPL.
 
-* Syntax
+** Design Goals
 
-** Create c function:
+- Create a Clojure DSL that allows C code to be written using Clojure
+  s-expressions and macros
+- Generate portable C99 compliant code that by default only
+  depends on the following 3 standard header files: stdint.h,
+  stddef.h, stdbool.h
+- Create an interface to different compiler backends that allows C
+  code to be dynamically compiled, loaded, and reloaded at the REPL in
+  development mode
+- Expose a plugin API that allows for extension modules such as an
+  optional type system that supports classes, interfaces, etc.
+- Generate well-formatted, human readable source code
+- Do not assume that memory can be dynamically allocated by default
+  (i.e. that malloc, free, new or delete are present)
+- Support enough C++ constructs for interacting with existing C++ code
+  in an optional C++ mode
+- Support as many Clojure-like concepts as possible wherever it does
+  not conflict with the other design goals.
+- Do not attempt to become a Clojure in C implementation (although
+  c-in-clj could be a good framework for creating such a thing)
+- Provide an efficient mechanism for loading statically compiled
+  libraries when in production mode (via P/Invoke on the CLR and JNI
+  on the JVM)
+- The core c-in-clj code should be Clojure implementation agnostic
+  (i.e. should run on JVM Clojure, ClojureCLR, etc.) while the
+  compiler backends will necessarily have to be implementation and
+  platform specific
+  
+** Rationale
+
+- C is the most portable language and is probably the only thing that
+  can be used on almost every platform from desktop to mobile to
+  embedded
+- Clojure features such as macros and dynamic development via the REPL
+  can greatly enhance productivity
+- C code can be written to perform as fast as anything else and
+  adapted to meet constraints such as limited memory
+- Almost everything can interop with C code (via P/Invoke for the CLR,
+  JNI for Java, etc.) because the C ABI is simple and consistent
+- Clojure can't be taken everywhere (especially when it comes to
+  embedded and mobile platforms), but it can generate code which can
+
+** Status
+
+- The only currently supported compiler is MSVC via ClojureCLR
+- The public API for creating C functions, global variables,
+  typedef's, enums, and structs is approaching stability
+- The private, plugin API should be considered very unstable
+  and subject to change
+
+** Syntax
+
+*** Create c function:
 
 #+begin_src clojure
-(cdefn function_name return_type [arg1_type arg1]
+(cdefn function_name ^return_type [^arg1_type arg1]
   function_body...)
 #+end_src
 
 ex:
 
 #+BEGIN_SRC clojure
-(cdefn test1 void [int32_t x int32_t y]
+(cdefn test1 ^void [^int32_t x ^int32_t y]
  (return (+ x y)))
 #+END_SRC
 
-** Instrinsic types:
-*** Fixed width integer types from <stdint.h> with the corresponding aliases:
+
+*** Instrinsic types:
+- Fixed width integer types from <stdint.h> with the corresponding aliases:
 | Type     | Alias(es) |
 |----------+-----------|
 | int8_t   | i8        |
-| uint8_t  | u8, byte  |
+| uint8_t  | u8        |
 | int16_t  | i16       |
 | uint16_t | u16       |
 | int32_t  | i32       |
@@ -32,14 +84,16 @@ ex:
 | int64_t  | i64       |
 | uint64_t | u64       |
 
-*** *float* (32-bit) and *double* (64-bit) floating point types
-*** void
-*** char
-** Pointer Types
+- *float* (32-bit) and *double* (64-bit) floating point types
+- void, char, size_t, ptrdiff_t
+- non-fixed width integer types like int, long, etc. will not be
+  supported directly (although they can be used if needed)
+
+*** Pointer Types
 Any type can be made into a pointer type by adding * to the end of it.
 Multiple *'s can be added to the end of a type name as needed.
 
-** Structures
+*** Structures
 C structure's can be defined as below:
 
 #+begin_src clojure
@@ -48,7 +102,7 @@ C structure's can be defined as below:
  ...)
 #+end_src
 
-** Literal symbol names
+*** Literal symbol names
 Any clojure keyword will be interpreted as a symbol literal. The
 disadvantage to this is that any literal symbols (keywords) will not
 be processed with any of the type and symbol information that c-in-clj
@@ -65,7 +119,7 @@ This can be useful for referencing compiler intrinsic types and
 symbols or symbols in referenced libraries without having to define
 them explicitly in c-in-clj.
 
-** Dynamic symbols redefinition
+*** Dynamic symbols redefinition
 c-in-clj supports the dynamic redefinition of symbols.  Support for
 this varies depending on the backend being used.  This can be useful
 for redefining functions at the repl.  For instance we can do the
@@ -87,7 +141,7 @@ Please be aware that backends may or may not throw an error when you
 try to redefine a function signature which will result in errors if
 not done carefully.
 
-** Keywords and Operators:
+*** Keywords and Operators:
 
 | c-in-clj expression   | c equivalent     |
 |-----------------------+------------------|
@@ -128,9 +182,9 @@ not done carefully.
 | (sizeof x)            | sizeof(x)        |
 | (cast i32* x)         | (int32_t*)x      |
    
-** c-in-clj statements
-   
-*** {} blocks
+*** c-in-clj statements
+    
+**** {} blocks
 
 (do
  (a)
@@ -143,7 +197,7 @@ not done carefully.
  c();
 }
    
-*** if, else
+**** if, else
 
 (if (> x y) (a))
 
@@ -182,7 +236,7 @@ if(x > y) a();
 else if(x < y) b();
 else c():
 
-*** switch/case
+**** switch/case
 
 (case x
  0 (return a)
@@ -202,7 +256,7 @@ switch(x)
   break;
 }
 
-*** while
+**** while
 
 (while (> x y)
  (if (not (a x)) (break);
@@ -214,7 +268,7 @@ while(x > y)
  --x;
 }
 
-*** for
+**** for
 
 (for (set! x 0) (< x len) (pos x)
  (if (a x) (continue))
@@ -235,7 +289,7 @@ for(i = 0, j = 0; i < x && j < y; ++i ++j)
  a(i, j);
 }
 
-*** goto
+**** goto
 
 (do
  (label a)
@@ -246,7 +300,7 @@ for(i = 0, j = 0; i < x && j < y; ++i ++j)
   if(b) goto a;
 }
 
-*** let
+**** let
 
 (let [^int x 0
       ^double y 1.0]
@@ -259,8 +313,8 @@ for(i = 0, j = 0; i < x && j < y; ++i ++j)
  b(y, x);
 }
 
-*** To Do items
-**** TODO array type names
-**** TODO let statements
-**** TODO cpp-mode only: \ (::)
-     
+**** To Do items
+***** TODO array type names
+***** TODO let statements
+***** TODO cpp-mode only: \ (::)
+      
