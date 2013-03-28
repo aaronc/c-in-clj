@@ -1,7 +1,7 @@
 * c-in-clj
 
-A Clojure DSL for generating C code and dynamically loading (and
-reloading) it from the Clojure REPL.
+A Clojure DSL for generating C code and dynamically loading it from
+the Clojure REPL.
 
 ** Design Goals
 
@@ -27,28 +27,27 @@ reloading) it from the Clojure REPL.
 - Provide an efficient mechanism for loading statically compiled
   libraries when in production mode (via P/Invoke on the CLR and JNI
   on the JVM)
-- The core c-in-clj code should be Clojure implementation agnostic
-  (i.e. should run on JVM Clojure, ClojureCLR, etc.) while the
-  compiler backends will necessarily have to be implementation and
-  platform specific
+- Provide a Clojure implementation agnostic core that can run on any
+  compliant Clojure implementation (compiler backends will necessarily
+  have to be implementation and platform specific)
   
 ** Rationale
 
 - C is the most portable language and is probably the only thing that
-  can be used on almost every platform from desktop to mobile to
+  can be used on almost every platform be that desktop, mobile, or
   embedded
 - Clojure features such as macros and dynamic development via the REPL
   can greatly enhance productivity
 - C code can be written to perform as fast as anything else and
   adapted to meet constraints such as limited memory
-- Almost everything can interop with C code (via P/Invoke for the CLR,
-  JNI for Java, etc.) because the C ABI is simple and consistent
+- C ABI is simple and consistent so almost everything can interop
+  with C code (via P/Invoke for the CLR, JNI for Java, etc.) 
 - Clojure can't be taken everywhere (especially when it comes to
   embedded and mobile platforms), but it can generate code which can
 
 ** Status
 
-- The only currently supported compiler is MSVC via ClojureCLR
+- Currently, the only supported compiler is MSVC via ClojureCLR
 - The public API for creating C functions, global variables,
   typedef's, enums, and structs is approaching stability
 - The private, plugin API should be considered very unstable
@@ -69,7 +68,6 @@ ex:
 (cdefn test1 ^void [^int32_t x ^int32_t y]
  (return (+ x y)))
 #+END_SRC
-
 
 *** Instrinsic types:
 - Fixed width integer types from <stdint.h> with the corresponding aliases:
@@ -102,24 +100,23 @@ C structure's can be defined as below:
  ...)
 #+end_src
 
-*** Literal symbol names
-Any clojure keyword will be interpreted as a symbol literal. The
-disadvantage to this is that any literal symbols (keywords) will not
-be processed with any of the type and symbol information that c-in-clj
-has available (used to invoke functions from the repl, dynamically
-redefine symbols, and for certain macros).
+*** Anonymous symbol and type names
+Anonymous symbol and type names can be used to interact with external
+code include using a cinclude declarative (i.e. (cinclude "stdio.h")).
+It is best to avoid anonymous symbols and types where possible because
+c-in-clj cannot make use of any type information.  In the future there
+will be mechanisms for specifiying external functions and types.
 
-ex:
-src_<clojure>{:void*} and src_<clojure>{void*} are equivalent except that c-in-clj can use the
-information in void* to know that this is a pointer type whereas
-c-in-clj will treat :void* as if it is just void (without any type
-information).
+**** Anonymous symbols
+Any Clojure keyword will be interpreted as an anonymous function or
+variable symbol when in a function or variable position
+(i.e. (:printf "Hello World") or (:printf :myString).
 
-This can be useful for referencing compiler intrinsic types and
-symbols or symbols in referenced libraries without having to define
-them explicitly in c-in-clj.
+**** Anonymous types
+Any Clojure string will be interpreted as an anonymous type when in a
+type position (i.e. ^"int" myVariable)
 
-*** Dynamic symbols redefinition
+*** Dynamic symbols redefinition and function invocation
 c-in-clj supports the dynamic redefinition of symbols.  Support for
 this varies depending on the backend being used.  This can be useful
 for redefining functions at the repl.  For instance we can do the
@@ -186,27 +183,26 @@ not done carefully.
     
 **** {} blocks
 
+#+BEGIN_SRC clojure
 (do
  (a)
  (b)
  (c))
+#+END_SRC
 
+#+BEGIN_SRC c
 {
  a();
  b();
  c();
 }
-   
+#+END_SRC
 **** if, else
 
+#+BEGIN_SRC clojure
 (if (> x y) (a))
 
-if(x > y) a();
-
 (if (> x y)) (a) (b))
-
-if(x > y) a();
-else b();
 
 (if (> x y)
  (do
@@ -215,6 +211,13 @@ else b();
  (do
   (c)
   (d)))
+#+END_SRC
+
+#+BEGIN_SRC c
+if(x > y) a();
+
+if(x > y) a();
+else b();
 
 if(x > y)
 {
@@ -226,23 +229,18 @@ else
  c();
  d();
 }
-
-(cond
- (> x y) (a)
- (< x y) (b)
- (c))
-
-if(x > y) a();
-else if(x < y) b();
-else c():
+#+END_SRC
 
 **** switch/case
 
+#+BEGIN_SRC clojure
 (case x
  0 (return a)
  1 (b)
  (c))
+#+END_SRC
 
+#+BEGIN_SRC c
 switch(x)
 {
  case 0:
@@ -255,66 +253,95 @@ switch(x)
   c();
   break;
 }
+#+END_SRC
 
 **** while
 
+#+BEGIN_SRC clojure
 (while (> x y)
  (if (not (a x)) (break);
  (dec x))
+#+END_SRC
 
+#+BEGIN_SRC c
 while(x > y)
 {
  if(!a(x)) break;
  --x;
 }
+#+END_SRC
 
 **** for
 
+#+BEGIN_SRC clojure
 (for (set! x 0) (< x len) (pos x)
  (if (a x) (continue))
  (b x))
 
+(for [(set! i 0) (set! j 0)] (and (< i x) (< j y)) [(inc i) (inc j)]
+ (a i j))
+#+END_SRC
+
+#+BEGIN_SRC c
 for(x = 0, x < len, ++x)
 {
  if(a(x)) continue;
  b(x);
 }
 
-
-(for [(set! i 0) (set! j 0)] (and (< i x) (< j y)) [(inc i) (inc j)]
- (a i j))
-
 for(i = 0, j = 0; i < x && j < y; ++i ++j)
 {
  a(i, j);
 }
+#+END_SRC
 
 **** goto
 
+#+BEGIN_SRC clojure
 (do
  (label a)
   (if (b) (goto a)))
+#+END_SRC
 
-{
- a:
-  if(b) goto a;
-}
-
-**** let
-
-(let [^int x 0
-      ^double y 1.0]
- (a x y) (b y x))
-
+#+BEGIN_SRC c
 {
  int x = 0;
  double y = 1.0;
  a(x, y);
  b(y, x);
 }
+#+END_SRC
 
-**** To Do items
-***** TODO array type names
-***** TODO let statements
-***** TODO cpp-mode only: \ (::)
+**** let
+#+BEGIN_SRC clojure
+(let [^int x 0
+      ^double y 1.0]
+ (a x y) (b y x))
+#+END_SRC
+
+#+BEGIN_SRC c
+{
+ int x = 0;
+ double y = 1.0;
+ a(x, y);
+ b(y, x);
+}
+#+END_SRC
+**** Literal C code
+#+BEGIN_SRC clojure
+(case ch
+ (c* "'\\n'")
+ (return 1)
+ (return 0))
+#+END_SRC
+
+#+BEGIN_SRC c
+switch(ch)
+{
+  case '\n':
+    return 1;
+  default:
+    return 0;
+}
+#+END_SRC
       
