@@ -1,11 +1,10 @@
 (ns c-in-clj.core
   (:require
    [clojure.string :as str]
-   [clojure.set :as set])
+   [clojure.set :as set]
+   [c-in-clj.platform :as platform])
   (:use
-   [c-in-clj.lang])
-  (:import
-   [System.IO Path File Directory]))
+   [c-in-clj.lang]))
 
 (defmacro csource-module [module-name & {:as opts}]
   `(def ~module-name
@@ -23,7 +22,7 @@
               (->Package package-name module (atom []) (atom {}) (atom #{}))
               (isa? (type module) :c-in-clj.lang/RuntimeModule)
               (->RuntimePackage package-name module (atom {}) (atom #{})))]
-    (add-package package)
+    (add-package module package)
     `(def ~package-sym ~package)))
 
 (defn cpackage-clone [module {:keys [declarations symbols
@@ -148,11 +147,11 @@
     (when (dev-mode?)
       (if (satisfies? IPackage package-or-include)
         (let [referenced-pkg package-or-include
-              decl (->PackageIncludeDeclaration package referenced-pkg opts nil)]
+              decl (with-meta (->PackageIncludeDeclaration package referenced-pkg) opts) ]
           (add-declaration package decl)
           decl)
         (let [include-name package-or-include
-              decl (->IncludeDeclaration package include-name opts nil)]
+              decl (with-meta (->IncludeDeclaration package include-name) opts)]
           (add-declaration package decl)
           decl)))))
 
@@ -204,15 +203,15 @@
                                 (write-impl decl)))))
            "\n")]
       (when src-output-path
-        (let [decl-path (Path/Combine src-output-path header-name)
-              impl-path (Path/Combine src-output-path
+        (let [decl-path (platform/path-combine src-output-path header-name)
+              impl-path (platform/path-combine src-output-path
                                       (str pkg-name
                                            (if cpp-mode ".cpp" ".c")))]
 
           (println "Writing" decl-path)
           (println "Writing" impl-path)
-          (File/WriteAllText decl-path decl-src)
-          (File/WriteAllText impl-path impl-src))))))
+          (platform/write-text-file decl-path decl-src)
+          (platform/write-text-file impl-path impl-src))))))
 
 (defn write-module-source [{:keys [packages cpp-mode src-output-path] :as module}]
   (doseq [[_ pkg] @packages]

@@ -2,7 +2,8 @@
   (:import [System.Diagnostics Process ProcessStartInfo]
            [System.IO Path File Directory]
            [System.Runtime.InteropServices Marshal GCHandle GCHandleType])
-  (:require [clojure.string :as str])
+  (:require [clojure.string :as str]
+            [c-in-clj.platform :as platform])
   (:use [c-in-clj.lang]
         [clojure.clr pinvoke emit]))
 
@@ -226,7 +227,7 @@
 (defn- init-cl-bat [temp-output-path msvc-path]
   (let [cl-bat-path (Path/Combine temp-output-path "cl.bat")
         x64 (= IntPtr/Size 8)]
-    (ensure-directory temp-output-path)
+    (platform/ensure-directory temp-output-path)
     (File/WriteAllText
      cl-bat-path
      (String/Format
@@ -247,9 +248,10 @@
                opts)]
     (MSVCCompileContext. (atom {}) (atom #{}) nil opts)))
 
-(defn- dll-load-symbol [{:keys [dll-name] :as loader} package-name {:keys [name ret-type params type var-type] :as sym-info}]
+(defn- dll-load-symbol [{:keys [dll-name] :as loader} package-name {:keys [name type func-type var-type] :as sym-info}]
   (if (= type :function)
-    (let [clr-ret (get-clr-type ret-type)
+    (let [{:keys [return-type params]} func-type
+          clr-ret (get-clr-type return-type)
           clr-params (get-clr-params params)]
       (dllimport* dll-name name clr-ret clr-params))
     (throw (ex-info (str "Don't know how to load symbol " name " of type " type) sym-info))))

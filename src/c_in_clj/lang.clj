@@ -1,9 +1,8 @@
 (ns c-in-clj.lang
   (:require
    [clojure.string :as str]
-   [clojure.set :as set])
-  (:import
-   [System.IO Path File Directory]))
+   [clojure.set :as set]
+   [c-in-clj.platform :as platform]))
 
 (defprotocol IHasType
   (get-type [this]))
@@ -167,6 +166,8 @@
   (print-simple (str "#" o (select-keys o [:module-name :loader])) w))
 
 (defrecord RuntimePackage [package-name module symbols referenced-packages]
+  clojure.lang.Named
+  (getName [_] package-name)
   IPackage
   (add-declaration [this decl]
     (when-let [decl-name (name decl)]
@@ -199,15 +200,11 @@
 (def default-cpp-preamble
   "#include <cstddef>\n#include <cstdint>\n")
 
-(defn ensure-directory [path]
-  (when-not (Directory/Exists path)
-    (Directory/CreateDirectory path)))
-
 (defn create-module [module-name init-compile-ctxt-fn init-load-ctxt-fn {:keys [dev] :as opts}]
   (if (if (not (nil? dev)) dev (dev-env?))
     (let [opts
           (merge
-           {:temp-output-path (Path/Combine (Path/GetTempPath) "c-in-clj")
+           {:temp-output-path (platform/path-combine (platform/get-temp-path) "c-in-clj")
             :cpp-mode false}
            opts)
           opts (merge {:preamble (if (:cpp-mode opts)
@@ -215,9 +212,9 @@
                                   default-c-preamble)}
                       opts)
           {:keys [src-output-path temp-output-path cpp-mode preamble]} opts]
-      (ensure-directory temp-output-path)
+      (platform/ensure-directory temp-output-path)
       (when src-output-path
-        (ensure-directory src-output-path))
+        (platform/ensure-directory src-output-path))
       (Module. module-name (init-compile-ctxt-fn opts)
                src-output-path temp-output-path
                preamble cpp-mode
@@ -1511,9 +1508,8 @@ Usage: (dispatch-hook hooks)."
 
 (defn- load-cfn [[func-name params & _]]
   (let [func-metadata (meta func-name)
-        ret-type (get-var-type-tag func-metadata)
-        params (parse-fn-params params)
-        fn-info {:name func-name :ret-type ret-type :params params :type :function}
+        fn-type (parse-fn-params params func-name)
+        fn-info {:name func-name :func-type fn-type :type :function}
         {:keys [loader]} (get-module)
         func (load-symbol loader (:name (get-package)) fn-info)]
     (intern *ns* (symbol (name func-name)) func)))
@@ -1551,8 +1547,8 @@ Usage: (dispatch-hook hooks)."
           filename (str/join  "_" (map name decls))
           ;; TODO save id??
           filename (str (name package) "_" filename "_" (swap! save-id inc) (if cpp-mode ".cpp" ".c"))
-          filename (Path/Combine temp-output-path filename)]
-      (File/WriteAllText filename src)
+          filename (platform/path-combine temp-output-path filename)]
+      (platform/write-text-file filename src)
       (CompileSource. src body filename))))
 
 (defn print-numbered [txt]
