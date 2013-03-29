@@ -5,6 +5,7 @@
   (:require [clojure.string :as str]
             [c-in-clj.platform :as platform])
   (:use [c-in-clj.lang]
+        [c-in-clj.runtime]
         [clojure.clr pinvoke emit]))
 
 (dllimports "kernel32.dll"

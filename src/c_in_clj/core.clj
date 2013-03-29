@@ -4,11 +4,12 @@
    [clojure.set :as set]
    [c-in-clj.platform :as platform])
   (:use
-   [c-in-clj.lang]))
+   [c-in-clj.lang]
+   [c-in-clj.runtime]))
 
 (defmacro csource-module [module-name & {:as opts}]
   `(def ~module-name
-     (c-in-clj.lang/create-module
+     (c-in-clj.runtime/create-module
       ~(name module-name)
       (constantly null-compile-context)
       (constantly null-loader-context)
@@ -18,9 +19,9 @@
   (let [module (eval module)
         package-name (name package-sym)
         package
-        (cond (isa? (type module) :c-in-clj.lang/Module)
+        (cond (isa? (type module) :c-in-clj.runtime/Module)
               (->Package package-name module (atom []) (atom {}) (atom #{}))
-              (isa? (type module) :c-in-clj.lang/RuntimeModule)
+              (isa? (type module) :c-in-clj.runtime/RuntimeModule)
               (->RuntimePackage package-name module (atom {}) (atom #{})))]
     (add-package module package)
     `(def ~package-sym ~package)))

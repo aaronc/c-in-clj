@@ -65,161 +65,24 @@
   (write-decl [this])
   (write-impl [this]))
 
-(defrecord CompileSource [source body-source filename])
-
 (defprotocol ISymbolScope
   (resolve-symbol [this symbol-name]))
 
 (defprotocol ITypeScope
   (resolve-type [this type-name]))
 
-(defprotocol ICompileContext
-  (write-hook [this hook-name expr])
-  (compile-decls [this decls compile-source]))
-
-(def null-compile-context
-  (reify
-    ICompileContext
-    (write-hook [this hook-name expr])
-    (compile-decls [this decls {:keys [source]}] (println source))
-    ISymbolScope
-    (resolve-symbol [this sym-name])
-    ITypeScope
-    (resolve-type [this type-name])))
-
-(defrecord Module [name
-                   compile-ctxt
-                   src-output-path
-                   temp-output-path
-                   preamble
-                   cpp-mode
-                   packages]
-  clojure.lang.Named
-  (getName [_] name)
-  ISymbolScope
-  (resolve-symbol [_ sym-name]
-    (resolve-symbol compile-ctxt sym-name))
-  ITypeScope
-  (resolve-type [_ type-name]
-    (resolve-type compile-ctxt type-name)))
-
-(derive Module ::Module)
-
-(defmethod print-method Module [o w]
-  (print-simple (str "#" o (select-keys o [:name])) w))
-
-(defn- find-index-of [items pred]
-  (loop [[item & more] items
-         idx 0]
-    (when item
-      (if (pred item)
-        idx
-        (recur more (inc idx))))))
-
 (defprotocol IPackage
   (add-declaration [this decl]))
 
-(defn- look-in-referenced-packages [referenced-packages target-sym]
-  (loop [[rp & more] (vec @referenced-packages)]
-    (when rp
-      (if-let [decl (get @(:symbols rp) target-sym)]
-        (if-not (:private (meta decl))
-          decl
-          (recur more))
-        (recur more)))))
-
-(defrecord Package [package-name module declarations symbols referenced-packages]
-  clojure.lang.Named
-  (getName [_] package-name)
-  IPackage
-  (add-declaration [this decl]
-    (when (satisfies? IDeclaration decl)
-      (let [decl-name (name decl)
-            existing-idx (find-index-of @declarations #(= (name %) decl-name))]
-        (if existing-idx
-          (swap! declarations assoc existing-idx decl)
-          (swap! declarations conj decl))))
-    (when-let [decl-name (name decl)]
-      (swap! symbols assoc decl-name decl)))
-  ISymbolScope
-  (resolve-symbol [_ sym-name]
-    (or (get @symbols sym-name)
-        (look-in-referenced-packages referenced-packages
-                                     sym-name)
-        (resolve-symbol module sym-name))))
-
-(defmethod print-method Package [o w]
-  (print-simple (str "#" o (select-keys o [:package-name :module])) w))
-
-(defprotocol ILoadContext
-  (load-symbol [this package-name symbol-info]))
-
-(def null-loader-context
-  (reify ILoadContext
-    (load-symbol [this package-name symbol-name])))
-
-(defrecord RuntimeModule [module-name loader packages])
-
-(derive RuntimeModule ::RuntimeModule)
-
-(defmethod print-method RuntimeModule [o w]
-  (print-simple (str "#" o (select-keys o [:module-name :loader])) w))
-
-(defrecord RuntimePackage [package-name module symbols referenced-packages]
-  clojure.lang.Named
-  (getName [_] package-name)
-  IPackage
-  (add-declaration [this decl]
-    (when-let [decl-name (name decl)]
-      (swap! symbols assoc decl-name decl)))
-  ISymbolScope
-  (resolve-symbol [_ sym-name]
-    (or (get @symbols sym-name)
-        (look-in-referenced-packages referenced-packages
-                                     sym-name)
-        (resolve-symbol module sym-name))))
-
-(defmethod print-method RuntimePackage [o w]
-  (print-simple (str "#" o (select-keys o [:package-name :module])) w))
+(defprotocol ICompileContext
+  (write-hook [this hook-name expr])
+  (compile-decls [this decls compile-source]))
 
 (def ^:private packages-by-ns (atom {}))
 
 (defn add-package [module package]
   (swap! (:packages module) assoc (name package) package)
   (swap! packages-by-ns assoc *ns* package))
-
-(def ^:dynamic *c-in-clj-dev-mode* false)
-
-(defn dev-env? []
-  (or *c-in-clj-dev-mode* (when-let [dev-var (Environment/GetEnvironmentVariable "C_IN_CLJ_DEV")]
-                        (not= "0" dev-var))))
-
-(def default-c-preamble
-  "#include <stddef.h>\n#include <stdint.h>\n#include <stdbool.h>\n")
-
-(def default-cpp-preamble
-  "#include <cstddef>\n#include <cstdint>\n")
-
-(defn create-module [module-name init-compile-ctxt-fn init-load-ctxt-fn {:keys [dev] :as opts}]
-  (if (if (not (nil? dev)) dev (dev-env?))
-    (let [opts
-          (merge
-           {:temp-output-path (platform/path-combine (platform/get-temp-path) "c-in-clj")
-            :cpp-mode false}
-           opts)
-          opts (merge {:preamble (if (:cpp-mode opts)
-                                  default-cpp-preamble
-                                  default-c-preamble)}
-                      opts)
-          {:keys [src-output-path temp-output-path cpp-mode preamble]} opts]
-      (platform/ensure-directory temp-output-path)
-      (when src-output-path
-        (platform/ensure-directory src-output-path))
-      (Module. module-name (init-compile-ctxt-fn opts)
-               src-output-path temp-output-path
-               preamble cpp-mode
-               (atom {})))
-    (RuntimeModule. module-name (init-load-ctxt-fn opts) (atom {}))))
 
 (def ^:dynamic *package* nil)
 
@@ -231,51 +94,11 @@
   (let [compile-ctxt (:compile-ctxt (get-module))]
     (write-hook compile-ctxt hook-name expr)))
 
-(defmacro defhooks [name]
-  `(let [hook-map# (atom {})]
-    (defmacro ~name
-      {:hook-map hook-map#}
-      [hook-name# args# & body#]
-      `(swap! hook-map# assoc
-             hook-name#
-             (fn ~(symbol (name hook-name#)) ~args#
-               ~@body#)))))
+(def ^:dynamic *locals* nil)
 
-(defmacro defhooks [name]
-  `(def ~name (atom {})))
+(def ^:dynamic *local-decls* nil)
 
-(defn add-hook [hooks hook-name hook-func]
-  (swap! hooks assoc (keyword (name hook-name)) hook-func)
-  nil)
-
-(defmacro defhook [hooks hook-name args & body]
-  `(do
-     (swap! ~hooks assoc
-            ~(keyword (name hook-name))
-            (fn ~(symbol (name hook-name)) ~args ~@body))
-     nil))
-
-(defn dispatch-hook
-  "Dispatches a hook to a hook map defined with defhooks.
-Usage: (dispatch-hook hooks)."
-  [hooks hook-name ctxt expr]
-  (when-let [hook-impl (get @hooks hook-name)]
-    (hook-impl ctxt expr)))
-
-(defn dev-mode?
-  ([]
-     (if-let [pkg (get-package)]
-       (dev-mode? (get-module))
-       (dev-env?)))
-  ([module] (instance? Module module)))
-
-(def ^:private ^:dynamic *locals* nil)
-
-(def ^:private ^:dynamic *local-decls* nil)
-
-(def ^:private ^:dynamic *referenced-decls* nil)
-
-(def ^:dynamic *dynamic-compile* false)
+(def ^:dynamic *referenced-decls* nil)
 
 (def ^:private primitive-types (atom {}))
 
@@ -283,9 +106,7 @@ Usage: (dispatch-hook hooks)."
 
 (def ^:private symbol-aliases (atom {}))
 
-(def ^:private save-id (atom 0))
-
-(def ^:private ^:dynamic *dynamic-compile-header* nil)
+(def ^:dynamic *dynamic-compile-header* nil)
 
 (defn- add-referenced-decl [resolved]
   ;; (println "trying to add ref to" (name resolved)
@@ -1066,7 +887,7 @@ Usage: (dispatch-hook hooks)."
 
 (defmethod expr-category Statement [_] :statement)
 
-(defn- cstatement [expr & {:keys [noindent]}]
+(defn cstatement [expr & {:keys [noindent]}]
   (let [expr (cexpand expr)]
     (when expr
       (if (or (is-block? expr) (= :statement (expr-category expr)))
@@ -1141,6 +962,8 @@ Usage: (dispatch-hook hooks)."
         (str "return " (reduce-parens expr))
         "return")
       "return")))
+
+(derive ReturnExpression ::ReturnExpression)
 
 (cintrinsic*
  'return
@@ -1356,7 +1179,7 @@ Usage: (dispatch-hook hooks)."
                (set_BANG_Expression. (VariableRefExpression. decl-expr) init-expr)))))
        (map cstatement body-forms))))))
 
-(defn- get-var-type-tag [metadata]
+(defn get-var-type-tag [metadata]
   (let [tag (:tag metadata)]
     (if (string? tag) (keyword tag) tag)))
 
@@ -1467,60 +1290,6 @@ Usage: (dispatch-hook hooks)."
                     (FunctionParameter. param-name param-type metadata nil)))))]
        (FunctionType. (name fn-name) ret-type params params-meta nil))))
 
-(defn- parse-cfn [[func-name & forms]]
-  (let [package (get-package)
-        f1 (first forms)
-        doc-str (when (string? f1) f1)
-        params (if doc-str (second forms) f1)
-        body-forms (if doc-str (nnext forms) (next forms))]
-    (binding [*referenced-decls* #{}]
-      (let [func-type (parse-fn-params params func-name)
-            params (:params func-type)]
-        (binding [*locals* (into {} (for [param params] [(name param) param]))
-                  *local-decls* []]
-          (let [func-metadata (meta func-name)
-                ret-type (:return-type func-type)
-                has-return (not (= "void" (name ret-type)))
-                body-forms (or body-forms (when has-return [(ReturnExpression. nil)]))
-                body-statements (vec (remove nil? (doall (map cstatement body-forms)))) 
-                local-decls (vec (doall (map cstatement *local-decls*)))
-                body-statements (concat local-decls body-statements)
-                body-block (if (and (= 1 (count body-statements))
-                                    (instance? BlockExpression (first body-statements)))
-                             (first body-statements)
-                             (BlockExpression. body-statements))
-                body-block
-                (if (and has-return (not (:disable-default-return func-metadata)))
-                  (wrap-last
-                   body-block
-                   (fn [expr]
-                     (if (instance? ReturnExpression expr)
-                       expr
-                       (ReturnExpression. expr))))
-                  body-block)
-                func-metadata (if doc-str
-                                (assoc func-metadata :doc doc-str)
-                                func-metadata)
-                func-name (name func-name)
-                func-decl (FunctionDeclaration. package func-name func-type body-block *referenced-decls* *locals* func-metadata nil)]
-            (add-declaration package func-decl)
-            func-decl))))))
-
-(defn- load-cfn [[func-name params & _]]
-  (let [func-metadata (meta func-name)
-        fn-type (parse-fn-params params func-name)
-        fn-info {:name func-name :func-type fn-type :type :function}
-        {:keys [loader]} (get-module)
-        func (load-symbol loader (:name (get-package)) fn-info)]
-    (intern *ns* (symbol (name func-name)) func)))
-
-;; (defn- write-dev-header [referenced-decls]
-;;   (doseq [decl referenced-decls]
-;;     (set! *dynamic-compile-header*
-;;           (str *dynamic-compile-header* "\n\n"
-;;                (write-decl decl))))
-;;   *dynamic-compile-header*)
-
 (defrecord IncludeDeclaration [package include-name]
   clojure.lang.Named
   (getName [_] include-name)
@@ -1528,50 +1297,7 @@ Usage: (dispatch-hook hooks)."
   (write-decl [_] (str "#include <" include-name ">"))
   (write-impl [_]))
 
-(defn- output-dev-src [package decls cpp-mode preamble temp-output-path]
-  (binding [*dynamic-compile* true
-            *dynamic-compile-header* ""
-            *referenced-decls* #{}]
-    (let [anon-header (str/join "\n\n" (doall
-                                        (remove
-                                         nil?
-                                         (for [decl @(:declarations package)]
-                                           (when (or (not (name decl))
-                                                     (instance? IncludeDeclaration decl))
-                                             (write-decl decl))))))
-          ;;referenced (apply set/union (map :referenced-decls decls))
-          body (str/join "\n\n" (doall (map write-impl decls)))
-          ;;header (str/trim (write-dev-header referenced))
-          header (str/trim *dynamic-compile-header*)
-          src (str/join "\n" [preamble anon-header header "\n" body])
-          filename (str/join  "_" (map name decls))
-          ;; TODO save id??
-          filename (str (name package) "_" filename "_" (swap! save-id inc) (if cpp-mode ".cpp" ".c"))
-          filename (platform/path-combine temp-output-path filename)]
-      (platform/write-text-file filename src)
-      (CompileSource. src body filename))))
-
-(defn print-numbered [txt]
-  (let [lines (str/split-lines txt)]
-    (doall
-     (map-indexed
-      (fn [i line] (println (str i "  " line))) lines))))
-
-(defn do-compile-decls [decls parse-fn load-fn]
-  (let [{:keys [module] :as package} (get-package)]
-    (if (dev-mode? module)
-      (let [{:keys [compile-ctxt temp-output-path preamble cpp-mode]} module
-            decls (doall (map parse-fn decls))
-            {:keys [body-source] :as src}
-            (output-dev-src package decls cpp-mode preamble temp-output-path)]
-        (when-let [compiled (compile-decls compile-ctxt decls src)]
-          (println body-source)
-          (doseq [[n v] compiled] (intern *ns* (symbol (name n)) v))))
-      (doseq [decl decls]
-        (load-fn decl)))))
-
-(defn compile-cfns [funcs]
-  (do-compile-decls funcs #'parse-cfn #'load-cfn))
+(derive IncludeDeclaration ::IncludeDeclaration)
 
 (defn unqualify-symbols [form]
   (if (seq? form)
@@ -1665,19 +1391,6 @@ Usage: (dispatch-hook hooks)."
 (defmethod expand-list-args GlobalVariableDeclaration
   [{:keys [var-name]} args]
   (FunctionCallExpression. var-name (map cexpand args)))
-
-(defn parse-cdef [[var-name init-expr]]
-  (let [package (get-package)
-        metadata (meta var-name)
-        var-name (name var-name)
-        tag (get-var-type-tag metadata)
-        var-type tag
-        init-expr (when init-expr (cexpand init-expr))
-        var-decl (GlobalVariableDeclaration. package var-name var-type init-expr metadata nil)]
-    (add-declaration package var-decl)
-    var-decl))
-
-(defn load-cdef [[var-name & _]])
 
 (defrecord RawCHeader [package txt]
   clojure.lang.Named
