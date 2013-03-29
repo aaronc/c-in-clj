@@ -299,7 +299,7 @@
 
 (declare cexpand)
 
-(defmacro defliteral [name ctype]
+(defmacro ^:private defliteral [name ctype]
   (let [ctype (lookup-type ctype)]
     `(do
        (defrecord ~name [value#]
@@ -488,7 +488,7 @@
 
 (def ^:private cintrinsics (atom {}))
 
-(defmacro csymbol-alias [symbol-alias symbol-name]
+(defmacro ^:private csymbol-alias [symbol-alias symbol-name]
   `(swap! symbol-aliases
           assoc
           '~symbol-alias
@@ -606,7 +606,7 @@
   (symbol (clojure.lang.Compiler/munge
            (str (name sym) "Expression"))))
 
-(defmacro cop [sym args & body]
+(defmacro ^:private cop [sym args & body]
   (let [rec-sym (get-expr-record-sym sym)]
     `(do
       (defrecord ~rec-sym ~args
@@ -620,31 +620,31 @@
     (when (apply = types)
       (first types))))
 
-(defmacro cbinop [sym]
+(defmacro ^:private cbinop [sym]
   `(cop ~sym [x# y#]
         (write-expr [_] (str "(" (write-expr x#) " " ~(name sym) " " (write-expr y#) ")"))
         IHasType
         (get-type [_] (get-bin-op-type x# y#))))
 
-(defmacro cbinop* [sym expr]
+(defmacro ^:private cbinop* [sym expr]
   `(cop ~sym [x# y#]
         (write-expr [_] (str "(" (write-expr x#) " " ~expr " " (write-expr y#) ")"))
         IHasType
         (get-type [_] (get-bin-op-type x# y#))))
 
-(defmacro cbinops [& syms]
+(defmacro ^:private cbinops [& syms]
   `(do ~@(for [x syms] `(cbinop ~x))))
 
-(defmacro compop [sym]
+(defmacro ^:private compop [sym]
   `(cop ~sym [x# y#]
         (write-expr [this#] (str "(" (write-expr x#) " " ~(name sym) " " (write-expr y#) ")"))
         IHasType
         (get-type [this#] 'bool)))
 
-(defmacro compops [& syms]
+(defmacro ^:private compops [& syms]
   `(do ~@(for [x syms] `(compop ~x))))
 
-(defmacro compop* [sym expr]
+(defmacro ^:private compop* [sym expr]
   `(cop ~sym [x# y#]
         (write-expr [this#] (str "(" (write-expr x#) " " ~expr " " (write-expr y#) ")"))
         IHasType
@@ -673,7 +673,7 @@
           expr))
       expr)))
 
-(defmacro cassignop [sym expr]
+(defmacro ^:private cassignop [sym expr]
   (let [rec-sym (get-expr-record-sym sym)]
     `(do
        (defrecord ~rec-sym
@@ -690,7 +690,7 @@
                      (fn [x#] (new ~rec-sym target# x#)))
           (new ~rec-sym target# source#))))))
 
-(defmacro c*op [sym]
+(defmacro ^:private c*op [sym]
   (let [rec-sym (get-expr-record-sym sym)]
     `(do
        (defrecord ~rec-sym [~'args]
@@ -705,7 +705,7 @@
                     (fn [& args#]
                       (new ~rec-sym (doall (map cexpand args#))))))))
 
-(defmacro comp*op* [sym expr]
+(defmacro ^:private comp*op* [sym expr]
   (let [rec-sym (get-expr-record-sym sym)]
     `(do
        (defrecord ~rec-sym [~'args]
@@ -718,7 +718,7 @@
                     (fn [& args#]
                       (new ~rec-sym (doall (map cexpand args#))))))))
 
-(defmacro c*ops [& syms]
+(defmacro ^:private c*ops [& syms]
   `(do ~@(for [x syms] `(c*op ~x))))
 
 (c*ops + - * /)
@@ -746,7 +746,7 @@
 (cassignop bit-not= "~=")
 (cassignop set! "=")
 
-(defmacro cunop [name arg & body]
+(defmacro ^:private cunop [name arg & body]
   `(cop ~name ~arg
         (write-expr [this#] ~@body)
         IHasType
