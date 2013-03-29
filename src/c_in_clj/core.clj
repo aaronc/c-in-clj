@@ -48,6 +48,153 @@
       (swap! (:packages module) assoc package-name new-pkg)
       new-pkg)))
 
+(defn cinclude [package-or-include & {:as opts}]
+  (let [package (get-package)]
+    (when (satisfies? IPackage package-or-include)
+      (swap! (:referenced-packages (get-package)) conj package-or-include))
+    (when (dev-mode?)
+      (if (satisfies? IPackage package-or-include)
+        (let [referenced-pkg package-or-include
+              decl (with-meta (->PackageIncludeDeclaration package referenced-pkg) opts) ]
+          (add-declaration package decl)
+          decl)
+        (let [include-name package-or-include
+              decl (with-meta (->IncludeDeclaration package include-name) opts)]
+          (add-declaration package decl)
+          decl)))))
+
+(defn- parse-cfn [[func-name & forms]]
+  (let [package (get-package)
+        f1 (first forms)
+        doc-str (when (string? f1) f1)
+        params (if doc-str (second forms) f1)
+        body-forms (if doc-str (nnext forms) (next forms))]
+    (binding [*referenced-decls* #{}]
+      (let [func-type (parse-fn-params params func-name)
+            params (:params func-type)]
+        (binding [*locals* (into {} (for [param params] [(name param) param]))
+                  *local-decls* []]
+          (let [func-metadata (meta func-name)
+                ret-type (:return-type func-type)
+                has-return (not (= "void" (name ret-type)))
+                body-forms (or body-forms (when has-return [(->ReturnExpression nil)]))
+                body-statements (vec (remove nil? (doall (map cstatement body-forms)))) 
+                local-decls (vec (doall (map cstatement *local-decls*)))
+                body-statements (concat local-decls body-statements)
+                body-block (if (and (= 1 (count body-statements))
+                                    (= :block (expr-category (first body-statements))))
+                             (first body-statements)
+                             (->BlockExpression body-statements))
+                body-block
+                (if (and has-return (not (:disable-default-return func-metadata)))
+                  (wrap-last
+                   body-block
+                   (fn [expr]
+                     (if (isa? (type expr) :c-in-clj.lang/ReturnExpression)
+                       expr
+                       (->ReturnExpression expr))))
+                  body-block)
+                func-metadata (if doc-str
+                                (assoc func-metadata :doc doc-str)
+                                func-metadata)
+                func-name (name func-name)
+                func-decl (with-meta (->FunctionDeclaration package func-name func-type body-block *referenced-decls* *locals*) func-metadata)]
+            (add-declaration package func-decl)
+            func-decl))))))
+
+(defn- load-cfn [[func-name params & _]]
+  (let [func-metadata (meta func-name)
+        fn-type (parse-fn-params params func-name)
+        fn-info {:name func-name :func-type fn-type :type :function}
+        {:keys [loader]} (get-module)
+        func (load-symbol loader (:name (get-package)) fn-info)]
+    (intern *ns* (symbol (name func-name)) func)))
+
+;; (defn- write-dev-header [referenced-decls]
+;;   (doseq [decl referenced-decls]
+;;     (set! *dynamic-compile-header*
+;;           (str *dynamic-compile-header* "\n\n"
+;;                (write-decl decl))))
+;;   *dynamic-compile-header*)
+
+(def ^:private save-id (atom 0))
+
+(defn- output-dev-src [package decls cpp-mode preamble temp-output-path]
+  (binding [*dynamic-compile* true
+            *dynamic-compile-header* ""
+            *referenced-decls* #{}]
+    (let [anon-header (str/join "\n\n" (doall
+                                        (remove
+                                         nil?
+                                         (for [decl @(:declarations package)]
+                                           (when (or (not (name decl))
+                                                     (isa? (type decl) :c-in-clj.lang/IncludeDeclaration))
+                                             (write-decl decl))))))
+          ;;referenced (apply set/union (map :referenced-decls decls))
+          body (str/join "\n\n" (doall (map write-impl decls)))
+          ;;header (str/trim (write-dev-header referenced))
+          header (str/trim *dynamic-compile-header*)
+          src (str/join "\n" [preamble anon-header header "\n" body])
+          filename (str/join  "_" (map name decls))
+          ;; TODO save id??
+          filename (str (name package) "_" filename "_" (swap! save-id inc) (if cpp-mode ".cpp" ".c"))
+          filename (platform/path-combine temp-output-path filename)]
+      (platform/write-text-file filename src)
+      (->CompileSource src body filename))))
+
+(defn- do-compile-decls [decls parse-fn load-fn]
+  (let [{:keys [module] :as package} (get-package)]
+    (if (dev-mode? module)
+      (let [{:keys [compile-ctxt temp-output-path preamble cpp-mode]} module
+            decls (doall (map parse-fn decls))
+            {:keys [body-source] :as src}
+            (output-dev-src package decls cpp-mode preamble temp-output-path)]
+        (when-let [compiled (compile-decls compile-ctxt decls src)]
+          (println body-source)
+          (doseq [[n v] compiled] (intern *ns* (symbol (name n)) v))))
+      (doseq [decl decls]
+        (load-fn decl)))))
+
+(defn- compile-cfns [funcs]
+  (do-compile-decls funcs #'parse-cfn #'load-cfn))
+
+(defn- parse-cdef [[var-name init-expr]]
+  (let [package (get-package)
+        metadata (meta var-name)
+        var-name (name var-name)
+        var-type (get-var-type-tag var-name)
+        init-expr (when init-expr (cexpand init-expr))
+        var-decl (with-meta (->GlobalVariableDeclaration package var-name var-type init-expr) metadata)]
+    (add-declaration package var-decl)
+    var-decl))
+
+(defn- load-cdef [[var-name & _]])
+
+(defn cdefn* [& forms]
+  (compile-cfns [forms]))
+
+(defmacro cdefn [& forms]
+  (apply cdefn* forms))
+
+(defmacro cdefn- [& forms]
+  (let [[sym & forms] forms
+        metadata (meta sym)
+        metadata (assoc metadata :private true)
+        sym (with-meta sym metadata)]
+    `(c-in-clj.core/cdefn ~sym ~@forms)))
+
+(defn cdefns* [& fns]
+  (compile-cfns fns))
+
+(defmacro cdefns [& fns]
+  (apply cdefns* fns))
+
+(defn cdef* [& forms]
+  (do-compile-decls [forms] parse-cdef load-cdef))
+
+(defmacro cdef [& forms]
+  (apply cdef* forms))
+
 (defn cmacro* [macro-name func]
   (when (dev-mode?)
     (let [macro (->CMacro macro-name func)]
@@ -80,25 +227,6 @@
 
 (defmacro cstruct [name & members]
   (cstruct* name members))
-
-(defn cdefn* [& forms]
-  (compile-cfns [forms]))
-
-(defmacro cdefn [& forms]
-  (apply cdefn* forms))
-
-(defmacro cdefn- [& forms]
-  (let [[sym & forms] forms
-        metadata (meta sym)
-        metadata (assoc metadata :private true)
-        sym (with-meta sym metadata)]
-    `(c-in-clj.core/cdefn ~sym ~@forms)))
-
-(defn cdefns* [& fns]
-  (compile-cfns fns))
-
-(defmacro cdefns [& fns]
-  (apply cdefns* fns))
 
 (defn ctypedef* [target-type typedef-name metadata]
   (let [package (get-package)
@@ -140,27 +268,6 @@
 
 (defmacro cenum [enum-name values]
   (cenum* enum-name values))
-
-(defn cinclude [package-or-include & {:as opts}]
-  (let [package (get-package)]
-    (when (satisfies? IPackage package-or-include)
-      (swap! (:referenced-packages (get-package)) conj package-or-include))
-    (when (dev-mode?)
-      (if (satisfies? IPackage package-or-include)
-        (let [referenced-pkg package-or-include
-              decl (with-meta (->PackageIncludeDeclaration package referenced-pkg) opts) ]
-          (add-declaration package decl)
-          decl)
-        (let [include-name package-or-include
-              decl (with-meta (->IncludeDeclaration package include-name) opts)]
-          (add-declaration package decl)
-          decl)))))
-
-(defn cdef* [& forms]
-  (do-compile-decls [forms] parse-cdef load-cdef))
-
-(defmacro cdef [& forms]
-  (apply cdef* forms))
 
 (defn cdefine [macro-name body]
   (when (dev-mode?)

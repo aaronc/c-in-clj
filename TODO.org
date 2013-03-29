@@ -17,3 +17,4 @@
 * block rewriting of all operators
 * compilation
 ** save id??
+* cpp-mode only: \ (::)
