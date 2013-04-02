@@ -2,5 +2,5 @@
  :dependencies [["ClojureClrEx"]]
  :disable-default-aot true
  :dll-exclusions [#"c_in_clj/gcc.*" #"c_in_clj/type-system.*"]
- :source-paths ["src" "clr-src"]
+ :source-paths ["src" "src-clr"]
  :key-file "%CLOJURE_SNK%"}

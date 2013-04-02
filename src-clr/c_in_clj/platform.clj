@@ -14,3 +14,13 @@
 
 (defn write-text-file [filename txt]
   (File/WriteAllText filename txt))
+
+(defn get-c-number-type [x]
+  (let [ntype (type x)]
+    (cond
+     (= ntype Int64)
+     (if (and (>= x Int32/MinValue) (<= x Int32/MaxValue))
+       'i32 
+       'i64 )
+     (= ntype Double)
+     'double)))

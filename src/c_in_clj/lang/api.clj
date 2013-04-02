@@ -118,7 +118,7 @@ get-name, get-name, sym->expr, list->expr")
 
 (defn is-scope? [x] (is-an-instance? x ::Scope))
 
-(defmulti scope-add (fn [scope element] (class scope)))
+(defmulti scope-add (fn [scope & decls] (class scope)))
 
 (defmulti scope-lookup-symbol (fn [scope sym] (class scope)))
 
@@ -160,7 +160,7 @@ get-name, get-name, sym->expr, list->expr")
                         {:type ::unresolved-symbol
                          :symbol sym})))))
 
-(defn ->expr [form] (scope-form->expr (get-ns-scope) form))
+(defn ->expr [form] (scope-form->expr (get-scope) form))
 
 ;; Some other useful constructs which will likely be used across languages
 

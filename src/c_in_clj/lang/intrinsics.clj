@@ -1,7 +1,8 @@
 (ns c-in-clj.lang.intrinsics
   (:use [c-in-clj.lang.api])
   (:require
-   [clojure.string :as str]))
+   [clojure.string :as str]
+   [c-in-clj.platform :as platform]))
 
 (derive-type ::CType)
 
@@ -109,14 +110,8 @@
 (def null-literal (NullLiteral.))
 
 (defn cnum->expr [x]
-  (let [ntype (type x)]
-    (cond
-     (= ntype Int64)
-     (if (and (>= x Int32/MinValue) (<= x Int32/MaxValue))
-       (Literal. 'i32 x)
-       (Literal. 'i64 x))
-     (= ntype Double)
-     (Literal. 'double x))))
+  (let [cnum-type (platform/get-c-number-type x)]
+    (Literal. cnum-type x)))
 
 (defn cmember-access-list->expr [sym args]
   (when-let [[_ member] (re-matches #"\.(.*)" (name sym))]
@@ -129,13 +124,15 @@
 
 (defn clist->expr [[sym & args]]
   (or
-   (member-access-list->expr sym args)
+   (cmember-access-list->expr sym args)
    (when-let [resolved (lookup-symbol sym)]
      (->expr (list->expr resolved args)))
-   (throw (ArgumentException. (str "Don't know how to handle list symbol " sym)))))
+   (throw (ex-info (str "Don't know how to handle list symbol " sym)
+                   {:type ::list-parse-exception
+                    :symbol sym
+                    :args args}))))
 
 (defn boolean? [x] (or (= x true) (= x false)))
-
 
 (defrecord InitializerList [values])
 (defmethod expr-write InitializerList
@@ -144,6 +141,11 @@
 
 (defn cvec->expr [values]
   (InitializerList. (map ->expr values)))
+
+(defrecord AnonymousVariableRefExpression [var-name])
+(derive-expr AnonymousVariableRefExpression)
+(defmethod expr-write AnonymousVariableRefExpression
+  [{:keys [var-name]}] (get-name var-name))
 
 (defn cform->expr [form]
   (cond
@@ -160,619 +162,15 @@
    :default
    (if-let [as-expr (get-method sym->expr form)]
      (cform->expr (as-expr form))
-     (throw (ArgumentException. (str "Don't know how to handle " form " of type " (type form)))))))
+     (throw (ex-info (str "Don't know how to handle " form " of type " (type form))
+                     {:type ::expression-parse-error
+                      :form form})))))
 
-;; Intrinsics
+;;;;;; Intrinsics
 
 (def ^:private cintrinsics (atom {}))
 
-(defn- cintrinsic* [sym func]
-  (swap! cintrinsics assoc sym func))
-(defmacro ^:private cintrinsic [sym args & body]
-  `(cintrinsic* '~sym
-               (fn ~sym ~args
-                 (let [~@ (doall (reduce (fn [res x] (into res [x `(->expr ~x)])) [] args))]
-                   ~@body))))
-
-(defn- get-expr-record-sym [sym]
-  (symbol (clojure.lang.Compiler/munge
-           (str (name sym) "Expression"))))
-
-(defmacro ^:private cop [sym args & body]
-  (let [rec-sym (get-expr-record-sym sym)]
-    `(do
-      (defrecord ~rec-sym ~args
-        IExpression
-        ~@body)
-      (cintrinsic ~sym ~args
-                  (new ~rec-sym ~@args)))))
-
-(defn- get-bin-op-type [& args]
-  (let [types (map get-type args)]
-    (when (apply = types)
-      (first types))))
-
-(defmacro ^:private cbinop [sym]
-  `(cop ~sym [x# y#]
-        (expr-write [_] (str "(" (expr-write x#) " " ~(name sym) " " (expr-write y#) ")"))
-        IHasType
-        (get-type [_] (get-bin-op-type x# y#))))
-
-(defmacro ^:private cbinop* [sym expr]
-  `(cop ~sym [x# y#]
-        (expr-write [_] (str "(" (expr-write x#) " " ~expr " " (expr-write y#) ")"))
-        IHasType
-        (get-type [_] (get-bin-op-type x# y#))))
-
-(defmacro ^:private cbinops [& syms]
-  `(do ~@(for [x syms] `(cbinop ~x))))
-
-(defmacro ^:private compop [sym]
-  `(cop ~sym [x# y#]
-        (expr-write [this#] (str "(" (expr-write x#) " " ~(name sym) " " (expr-write y#) ")"))
-        IHasType
-        (get-type [this#] 'bool)))
-
-(defmacro ^:private compops [& syms]
-  `(do ~@(for [x syms] `(compop ~x))))
-
-(defmacro ^:private compop* [sym expr]
-  `(cop ~sym [x# y#]
-        (expr-write [this#] (str "(" (expr-write x#) " " ~expr " " (expr-write y#) ")"))
-        IHasType
-        (get-type [this#] 'bool)))
-
-(defn- reduce-parens [^String expr]
-  (when expr
-    (if (= (first expr) \()
-      (let [len (count expr)
-            matching-paren-idx
-            (loop [idx 1
-                   depth 1]
-              (when (< idx len)
-                (let [ch (nth expr idx)]
-                  (cond
-                   (= \( ch)
-                   (recur (inc idx) (inc depth))
-                   (= \) ch)
-                   (if (= depth 1)
-                     idx
-                     (recur (inc idx) (dec depth)))
-                   :default
-                   (recur (inc idx) depth)))))]
-        (if (= matching-paren-idx (- len 1))
-          (subs expr 1 (- len 1))
-          expr))
-      expr)))
-
-(defmacro ^:private cassignop [sym expr]
-  (let [rec-sym (get-expr-record-sym sym)]
-    `(do
-       (defrecord ~rec-sym
-           [x# y#]
-         IHasType
-         (get-type [_])
-         IExpression
-         (expr-write [this#] (str "(" (expr-write x#) " " ~expr " " (reduce-parens (expr-write y#)) ")")))
-       (cintrinsic
-        ~sym
-        [target# source#]
-        (if (is-block? source#)
-          (wrap-last source#
-                     (fn [x#] (new ~rec-sym target# x#)))
-          (new ~rec-sym target# source#))))))
-
-(defmacro ^:private c*op [sym]
-  (let [rec-sym (get-expr-record-sym sym)]
-    `(do
-       (defrecord ~rec-sym [~'args]
-         IExpression
-         (expr-write [_]
-           (if (= 1 (count ~'args))
-             (str ~(name sym) (expr-write (first ~'args)))
-             (str "(" (str/join ~(str " " sym " ") (map expr-write ~'args)) ")")))
-         IHasType
-         (get-type [_] (apply get-bin-op-type ~'args)))
-       (cintrinsic* '~sym
-                    (fn [& args#]
-                      (new ~rec-sym (doall (map ->expr args#))))))))
-
-(defmacro ^:private comp*op* [sym expr]
-  (let [rec-sym (get-expr-record-sym sym)]
-    `(do
-       (defrecord ~rec-sym [~'args]
-         IExpression
-         (expr-write [_]
-           (str "(" (str/join ~(str " " expr " ") (map expr-write ~'args)) ")"))
-         IHasType
-         (get-type [_] (lookup-type 'bool)))
-       (cintrinsic* '~sym
-                    (fn [& args#]
-                      (new ~rec-sym (doall (map ->expr args#))))))))
-
-(defmacro ^:private c*ops [& syms]
-  `(do ~@(for [x syms] `(c*op ~x))))
-
-(c*ops + - * /)
-(cassignop += "+=")
-(cassignop -= "-=")
-(cassignop *= "*=")
-(cassignop /= "/=")
-(compops < > <= >=)
-(compop* = "==")
-(compop* not= "!=")
-(cbinop* mod "%")
-(cassignop mod= "%=")
-(comp*op* or "||")
-(comp*op* and "&&")
-(cbinop* bit-or "|")
-(cassignop bit-or= "|=")
-(cbinop* bit-and "&")
-(cassignop bit-and= "&=")
-(cbinop* bit-shift-left "<<")
-(cassignop bit-shift-left="<<=")
-(cbinop* bit-shift-right ">>")
-(cassignop bit-shift-right= ">>=")
-(cbinop* bit-xor "^")
-(cassignop bit-xor= "^=")
-(cassignop bit-not= "~=")
-(cassignop set! "=")
-
-(defmacro ^:private cunop [name arg & body]
-  `(cop ~name ~arg
-        (expr-write [this#] ~@body)
-        IHasType
-        (get-type [this#] (get-type ~(first arg)))))
-
-(defn- write-str [& args]
-  (apply str (for [arg args]
-               (if (string? arg)
-                 arg
-                 (expr-write arg)))))
-
-(cunop inc [x] (write-str "++" x))
-(cunop dec [x] (write-str "--" x))
-(cunop post-inc [x] (write-str x "++"))
-(cunop post-dec [x] (write-str x "--"))
-(cunop bit-not [x] (write-str "~" x))
-
-(cop not [x]
-     (expr-write [_] (str "!" (expr-write x)))
-     IHasType
-     (get-type [_] (lookup-type 'bool)))
-
-(defrecord SizeofExpression [x]
-  IExpression
-  (expr-write [_] (let [type (lookup-type x)]
-               (str "sizeof(" (type-write type) ")")))
-  IHasType
-  (get-type [_] (lookup-type 'size_t)))
-
-(cintrinsic*
- 'sizeof (fn [x]
-           (SizeofExpression. x)))
-
-;; (defn c* [& args]
-;;   (let [expanded (for [arg args]
-;;                    (if (string? arg)
-;;                      arg
-;;                      (->expr arg)))]
-;;     (apply str expanded)))
-
-;; (cintrinsic 'c* c*)
-
-(defrecord StructFieldAccessExpression [instance-expr member-info pointer-depth]
-  IHasType
-  (get-type [_] (get-type member-info))
-  IExpression
-  (expr-write [_]
-    (let [prefix-pointer (when (>= pointer-depth 2)
-                           (- pointer-depth 2))
-          pointer-depth (if prefix-pointer 1
-                            pointer-depth)]
-      (str
-       (when prefix-pointer
-         (apply str "(" (repeat prefix-pointer "*")))
-       (expr-write instance-expr)
-       (when prefix-pointer ")")
-       (case pointer-depth
-         0 "."
-         1 "->")
-       (name member-info)))))
-
-(cintrinsic* '.
-             (fn [instance-expr member-name & args]
-               (let [instance-expr (->expr instance-expr)
-                     instance-type (get-type instance-expr)
-                     access-expr (type-create-field-access-expr
-                                  instance-type instance-expr member-name)]
-                 (if args
-                   (let [args (map ->expr args)]
-                     (ComputedFunctionCallExpression. access-expr args))
-                   access-expr))))
-
-(cintrinsic* '->
-            (fn [& args]
-              (let [args (map ->expr args)]
-                (reify
-                  IHasType
-                  (get-type [_])
-                  IExpression
-                  (expr-write [_]
-                    (str/join "->" (map expr-write args)))))))
-
-(cop aget [x y]
-     (expr-write [_] (write-str x "[" y "]"))
-     IHasType
-     (get-type [_]
-               (lookup-type (type-dereferenced-type (get-type x)))))
-
-(defrecord ArraySetExpression [target idx value]
-  IHasType
-  (get-type [_] (get-type target))
-  IExpression
-  (expr-write [_] (write-str target "[" idx "] = " value)))
-
-(cintrinsic aset [target idx value]
-            (if (is-block? value)
-              (wrap-last value (fn [x] (ArraySetExpression. target idx x)))
-              (ArraySetExpression. target idx value)))
-
-(cop ref [x]
-     (expr-write [_] (write-str "(&" x ")"))
-     IHasType
-     (get-type [_]))
-
-(cop deref [x]
-     (expr-write [_] (write-str "*" x))
-     IHasType
-     (get-type [_]))
-
-(csymbol-alias 'clojure.core/deref deref)
-
-(defrecord CVerbatim [args]
-  IHasType
-  (get-type [_])
-  IExpression
-  (expr-write [_]
-    (apply write-str args)))
-
-(cintrinsic* 'c*
-            (fn [& args]
-              (CVerbatim.
-               (map (fn [x]
-                      (if (string? x) x (->expr x)))
-                    args))))
-
-(def ^:dynamic *indent* 0)
-
-(defn- indent [] (str/join (for [x (range *indent*)] "\t")))
-
-(defrecord Statement [expr noindent]
-  IExpression
-  (wrap-last [_ func]
-    (Statement. (func expr) noindent))
-  (expr-write [_]
-    (str (when-not noindent (indent)) (reduce-parens (expr-write expr)) ";"))
-  IHasType
-  (get-type [_] (get-type expr)))
-
-(defmethod expr-category Statement [_] :statement)
-
-(defn cstatement [expr & {:keys [noindent]}]
-  (let [expr (->expr expr)]
-    (when expr
-      (if (or (is-block? expr) (= :statement (expr-category expr)))
-        expr
-        (Statement. (->expr expr) noindent)))))
-
-(defn- wrap-statements [func statements]
-  (conj (vec (drop-last statements))
-        (wrap-last (last statements) func)))
-
-(defrecord Statements [statements]
-  IExpression
-  (expr-write [_] (str/join "\n" (map expr-write statements)))
-  (wrap-last [_ func]
-    (Statements.
-     (wrap-statements func statements)))
-  IHasType
-  (get-type [_] (get-type (last statements))))
-
-(defmethod expr-category Statements [_] :statement*)
-
-(defn- cstatements [statements]
-  (Statements. (doall (map cstatement (remove nil? statements)))))
-
-(defrecord CaseExpression [test cases]
-  IHasType
-  (get-type [_])
-  IExpression
-  (expr-write [_]
-    (let [cases
-          (binding [*indent* (inc *indent*)]
-            (for [[expr block] cases]
-              (if block
-                (let [block (binding [*indent* (inc *indent*)]
-                              (expr-write block))]
-                  (str (indent) "case " (expr-write expr) ":\n" block "\n" (indent) "break;\n"))
-                (str (indent) "default:" (expr-write expr) "\n" (indent) "break;\n"))))]
-      (str "switch(" (expr-write test) ") {\n" (str/join "\n" cases) (indent) "\n}")))
-  (wrap-last [_ func]
-    (CaseExpression.
-     test
-     (for [[expr block] cases]
-       (if block
-         [expr (wrap-last block func)]
-         [(wrap-last expr func)])))))
-
-(defmethod expr-category CaseExpression [_] :statement)
-
-(cintrinsic*
- 'case
- (fn [test & args]
-   (let [test (->expr test)
-         cases (partition 2 args)
-         has-default (odd? (count args))
-         cases
-         (vec
-          (for [[expr block] cases]
-            [(->expr expr)
-             (cstatement block)]))
-         cases (if has-default
-                 (conj cases [(cstatement (last args))])
-                 cases)]
-     (CaseExpression. test cases))))
-
-(defrecord ReturnExpression [expr]
-  IHasType
-  (get-type [_] (get-type expr))
-  IExpression
-  (expr-write [_]
-    (if expr
-      (if-let [expr (expr-write expr)]
-        (str "return " (reduce-parens expr))
-        "return")
-      "return")))
-
-(derive ReturnExpression ::ReturnExpression)
-
-(cintrinsic*
- 'return
- (fn
-   ([] (ReturnExpression. nil))
-   ([expr]
-      (let [expr (->expr expr)]
-        (if (is-block? expr)
-          (wrap-last expr (fn [x] (ReturnExpression. x)))
-          (ReturnExpression. expr))))))
-
-;; (defn cblock [statements]
-;;   (str (indent) "{\n"
-;;        (binding [*indent* (inc *indent*)]
-;;          (cstatements statements))
-;;        "\n" (indent) "}"))
-
-;; (defn child-block [statements]
-;;   (let [nsts (count statements)]
-;;                      (cond
-;;                       (= 0 nsts) "{ }"
-;;                       ;; (= 1 nsts) (binding [*indent* (inc *indent*)]
-;;                       ;;              (cstatement (first statements)))
-;;                       :default (cblock statements))))
-
-(declare cblock)
-
-(defrecord IfExpression [expr then else]
-  IHasType
-  (get-type [_])
-  IExpression
-  (expr-write [_]
-    (str (indent)
-         "if(" (reduce-parens (expr-write expr)) ")\n"
-         (expr-write then)
-         (when else
-           (str "\n" (indent) "else\n"
-                (expr-write else)))))
-  (wrap-last [_ func]
-    (IfExpression.
-     expr
-     (wrap-last then func)
-     (when else (wrap-last else func)))))
-
-(defmethod expr-category IfExpression [_] :statement*)
-
-(cintrinsic* 'if
-             (fn
-               ([expr then]
-                  (IfExpression. (->expr expr)
-                                 (cblock then)
-                                 nil))
-              ([expr then else]
-                 (IfExpression. (->expr expr)
-                                (cblock then)
-                                (cblock else)))))
-
-(defrecord DeclExpression [var-type var-name init-expr]
-  IHasType
-  (get-type [_] var-type)
-  IExpression
-  (expr-write [_] (str (type-write-decl-expr var-type var-name) "=" (when init-expr (expr-write init-expr)))))
-
-(defrecord BlockExpression [statements]
-  IHasType
-  (get-type [_] (get-type (last statements)))
-  IExpression
-  (wrap-last [_ func]
-    (BlockExpression.
-     (wrap-statements func statements)))
-  (expr-write [_]
-    (str (indent) "{\n"
-       (binding [*indent* (inc *indent*)]
-         (str/join "\n" (map expr-write statements)))
-       "\n" (indent) "}")))
-
-(defmethod expr-category BlockExpression [_] :block)
-
-(defn- cblock [& statements]
-  (BlockExpression. (doall (map cstatement (remove nil? statements)))))
-
-(cintrinsic* 'do cblock)
-
-(defrecord ForStatement [init-expr test-expr each-expr body]
-    IHasType
-    (get-type [_])
-    IExpression
-    (expr-write [_]
-      (str (indent) "for("
-           (reduce-parens (expr-write init-expr)) "; "
-           (reduce-parens (expr-write test-expr)) "; "
-           (reduce-parens (expr-write each-expr)) ")\n"
-           (expr-write body)))
-    (wrap-last [_ func] (throw (Exception. "Cannot take value of for statement"))))
-
-(defmethod expr-category ForStatement [_] :statement)
-
-(defrecord CommaExpression [expressions]
-  IHasType
-  (get-type [_])
-  IExpression
-  (expr-write [_] (str/join ", " (map expr-write expressions))))
-
-(defmethod expr-category CommaExpression [_] :statement)
-
-(defrecord NopExpression []
-  IHasType
-  (get-type [_])
-  IExpression
-  (expr-write [_]))
-
-(defn- wrap-for-expressions [form]
-  (cond
-   (empty? form)
-   (NopExpression.)
-   (vector? form)
-   (CommaExpression. (map ->expr form))
-   :default
-   (->expr form)))
-
-(cintrinsic* 'for
-             (fn [init test each & body]
-               (let [body (apply cblock body)]
-                 (ForStatement.
-                  (wrap-for-expressions init)
-                  (wrap-for-expressions test)
-                  (wrap-for-expressions each)
-                  body))))
-
-(defrecord WhileStatement [test-expr body]
-    IHasType
-    (get-type [_])
-    IExpression
-    (expr-write [_]
-      (str (indent) "while(" (reduce-parens (expr-write test-expr)) ")\n"
-           (expr-write body)))
-    (wrap-last [_ func] (throw (Exception. "Cannot take value of while statement"))))
-
-(defmethod expr-category WhileStatement [_] :statement)
-
-(cintrinsic* 'while
-             (fn [test & body]
-               (let [body (apply cblock body)]
-                 (WhileStatement.
-                  (->expr test)
-                  body))))
-
-
-(defrecord BreakStatement []
-  IHasType
-  (get-type [_])
-  IExpression
-  (expr-write [_] "break"))
-
-(cintrinsic break [] (BreakStatement.))
-
-(defrecord ContinueStatement []
-  IHasType
-  (get-type [_])
-  IExpression
-  (expr-write [_] "continue"))
-
-(cintrinsic continue [] (ContinueStatement.))
-
-(defrecord LabelStatement [label]
-  IHasType
-  (get-type [_])
-  IExpression
-  (expr-write [_] (str (name label) ":")))
-
-(defmethod expr-category LabelStatement [_] :statement)
-
-(cintrinsic* 'label (fn [x] (LabelStatement. x)))
-
-(defrecord GotoExpression [label]
-  IHasType
-  (get-type [_])
-  IExpression
-  (expr-write [_] (str "goto " (name label))))
-
-(cintrinsic* 'goto (fn [x] (GotoExpression. x)))
-
-(defn- add-local [decl]
-  (let [var-name (name decl)]
-    (assert *locals* "No local variable context for let expression")
-    (assert (not (get *locals* var-name))
-            (str "Local variable named " var-name " already defined"))
-    (set! *locals* (assoc *locals* var-name decl))
-    (set! *local-decls* (conj *local-decls* decl))))
-
-(cintrinsic*
- 'let
- (fn [& forms]
-   (let [let-forms (first forms)
-         body-forms (rest forms)]
-     (assert (even? (count let-forms)) "let expression must contain an even number of forms")
-     (cstatements
-      (concat
-       (for [[decl expr-form] (partition 2 let-forms)]
-         (let [init-expr (->expr expr-form)
-               explicit-tag (:tag (meta decl))
-               decl-type (if explicit-tag
-                           explicit-tag
-                           (get-type init-expr))]
-           (assert decl-type (str "unable to infer type for let binding: " decl " " expr-form))
-           (let [decl-type (lookup-type decl-type)
-                 decl-expr (create-var-decl
-                            (name decl)
-                            decl-type)]
-             (add-local decl-expr)
-             (if (is-block? init-expr)
-               (wrap-last init-expr (fn [x] (set_BANG_Expression. (VariableRefExpression. decl-expr) x)))
-               (set_BANG_Expression. (VariableRefExpression. decl-expr) init-expr)))))
-       (map cstatement body-forms))))))
-
-(defn get-var-type-tag [metadata]
-  (let [tag (:tag metadata)]
-    (if (string? tag) (keyword tag) tag)))
-
-(defn- declare-fn [sym]
-  (if-let [decl-type (get-var-type-tag (meta sym))]
-    (do
-      (add-local
-       (create-var-decl (name sym) decl-type))
-      (NopExpression.))
-     (throw (ArgumentException.
-             (str "Unable to infer type for declare expression of symbol" sym)))))
-
-(cintrinsic* 'declare declare-fn)
-
-(def ^:private set!-fn (get @cintrinsics 'set!))
-
-(cintrinsic*
- 'def
- (fn def-fn [sym init-expr]
-   (declare-fn sym)
-   (set!-fn sym init-expr)))
+(defn- add-intrinsic [sym f] (swap! cintrinsics assoc (name sym) f))
 
 (defn reduce-parens [^String expr]
   (when expr
@@ -798,8 +196,6 @@
       expr)))
 
 ;;;;; Operators
-
-(defn- add-intrinsic [sym f] (swap! cintrinsics assoc sym f))
 
 (defn get-bin-op-type [& args]
   (let [types (map get-type args)]
@@ -843,21 +239,21 @@
   (CompOp. sym (->expr x) (->expr x)))
 
 (doseq [s '[< > <= >=]]
-  (add-intrinsic s (partial parse-comp-op s)))  
+  (add-intrinsic s (partial parse-comp-op s)))
 
 (add-intrinsic '= (partial parse-comp-op "=="))
-(add-intrinsic not= (partial parse-comp-op "!="))
+(add-intrinsic 'not= (partial parse-comp-op "!="))
 
 ;;;; Assignment Operators
 
 (defrecord AssignOp [sym target source])
 (derive-expr AssignOp)
 (defmethod expr-write AssignOp
-  [{:keys [sym x y]}]
+  [{:keys [sym target source]}]
   (str "(" (expr-write target) " " sym " " (reduce-parens (expr-write source)) ")"))
 
 (defn parse-assign-op [sym target source]
-  (expr-wrap-last source (fn [x] (AssignOp. target x))))
+  (expr-wrap-last source (fn [x] (AssignOp. sym target x))))
 
 (defn add-assign-op [op-sym output-sym]
   (add-intrinsic op-sym (partial parse-assign-op output-sym)))
@@ -865,7 +261,7 @@
 (add-assign-op '+= "+=")
 (add-assign-op '-= "-=")
 (add-assign-op '*= "*=")
-(add-assign-op '/= "/=")
+(add-assign-op 'div= "/=")
 (add-assign-op 'mod= "%=")
 (add-assign-op 'bit-or= "|=")
 (add-assign-op 'bit-and= "&=")
@@ -910,136 +306,129 @@
   [{:keys [func x]}]
   (func (expr-write x)))
 
+(defn parse-un-op [func x] (UnaryOperation. func (->expr x)))
 
-;;;; TODO:
+(defn add-un-op [sym func]
+  (add-intrinsic sym (partial parse-un-op)))
 
-(cunop inc [x] (write-str "++" x))
-(cunop dec [x] (write-str "--" x))
-(cunop post-inc [x] (write-str x "++"))
-(cunop post-dec [x] (write-str x "--"))
-(cunop bit-not [x] (write-str "~" x))
+(add-un-op 'inc #(str "++" %))
+(add-un-op 'dec #(str "--" %))
+(add-un-op 'post-inc #(str % "++"))
+(add-un-op 'post-dec #(str % "--"))
+(add-un-op 'bit-not #(str "~" %))
 
-(cop not [x]
-     (expr-write [_] (str "!" (expr-write x)))
-     IHasType
-     (get-type [_] (lookup-type 'bool)))
+(defrecord NotExpression [x])
+(derive-expr NotExpression)
+(defmethod expr-write NotExpression
+  [{:keys [x]}]
+  (str "!" (expr-write x)))
+(defmethod get-type NotExpression [_] 'bool)
+(defn parse-not-op [x] (NotExpression. (->expr x)))
+(add-intrinsic 'not parse-not-op)
 
-(defrecord SizeofExpression [x]
-  IExpression
-  (expr-write [_] (let [type (lookup-type x)]
-               (str "sizeof(" (type-write type) ")")))
-  IHasType
-  (get-type [_] (lookup-type 'size_t)))
+(defrecord SizeofExpression [x])
+(derive-expr SizeofExpression)
+(defmethod expr-write SizeofExpression
+  [{:keys [x]}]
+  (let [type (lookup-type x)]
+    (str "sizeof(" (type-write type) ")")))
+(defmethod get-type SizeofExpression [_] 'size_t)
+(add-intrinsic 'sizeof (fn [x] (SizeofExpression. x)))
 
-(cintrinsic*
- 'sizeof (fn [x]
-           (SizeofExpression. x)))
+(defrecord ComputedFunctionCallExpression [func-expr args])
+(derive-expr ComputedFunctionCallExpression)
+(defmethod expr-write ComputedFunctionCallExpression
+  [{:keys [func-expr args]}]
+  (str (expr-write func-expr)
+       "(" (str/join "," (map expr-write args)) ")"))
+(defmethod get-type ComputedFunctionCallExpression
+  [{:keys [func-expr]}]
+  (get-type func-expr))
 
-;; (defn c* [& args]
-;;   (let [expanded (for [arg args]
-;;                    (if (string? arg)
-;;                      arg
-;;                      (->expr arg)))]
-;;     (apply str expanded)))
+(add-intrinsic '.
+               (fn [instance-expr member-name & args]
+                 (let [instance-expr (->expr instance-expr)
+                       instance-type (get-type instance-expr)
+                       access-expr (type-create-field-access-expr
+                                    instance-type instance-expr member-name)]
+                   (if args
+                     (let [args (map ->expr args)]
+                       (ComputedFunctionCallExpression. access-expr args))
+                     access-expr))))
 
-;; (cintrinsic 'c* c*)
+(defrecord StructureDereferenceExpression [source target])
+(derive-expr StructureDereferenceExpression)
+(defmethod expr-write StructureDereferenceExpression
+  [{:keys [source target]}]
+  (str (expr-write source) "->" (expr-write target)))
+(add-intrinsic '.->
+             (fn [source target] (StructureDereferenceExpression. (->expr source) (->expr target))))
 
-(defrecord StructFieldAccessExpression [instance-expr member-info pointer-depth]
-  IHasType
-  (get-type [_] (get-type member-info))
-  IExpression
-  (expr-write [_]
-    (let [prefix-pointer (when (>= pointer-depth 2)
-                           (- pointer-depth 2))
-          pointer-depth (if prefix-pointer 1
-                            pointer-depth)]
-      (str
-       (when prefix-pointer
-         (apply str "(" (repeat prefix-pointer "*")))
-       (expr-write instance-expr)
-       (when prefix-pointer ")")
-       (case pointer-depth
-         0 "."
-         1 "->")
-       (name member-info)))))
+(defrecord ArrayGetExpression [target idx])
+(derive-expr ArrayGetExpression)
+(defmethod expr-write ArrayGetExpression
+  [{:keys [target idx]}]
+  (str (expr-write target) "[" (expr-write idx) "]"))
+(defmethod get-type ArrayGetExpression
+  [{:keys [target idx]}]
+  (lookup-type (type-dereferenced-type (get-type target))))
+(add-intrinsic 'aget (fn [target idx] (ArrayGetExpression. (->expr target) (->expr idx))))
 
-(cintrinsic* '.
-             (fn [instance-expr member-name & args]
-               (let [instance-expr (->expr instance-expr)
-                     instance-type (get-type instance-expr)
-                     access-expr (type-create-field-access-expr
-                                  instance-type instance-expr member-name)]
-                 (if args
-                   (let [args (map ->expr args)]
-                     (ComputedFunctionCallExpression. access-expr args))
-                   access-expr))))
+(defrecord ArraySetExpression [target idx value])
+(derive-expr ArraySetExpression)
+(defmethod expr-write ArraySetExpression
+  [{:keys [target idx value]}]
+  (str (expr-write target) "[" (expr-write idx) "] = " (expr-write value)))
+(add-intrinsic 'aset
+               (fn [target idx value]
+                 (expr-wrap-last value (fn [x] (ArraySetExpression. (->expr target) (->expr idx) x)))))
 
-(cintrinsic* '->
-            (fn [& args]
-              (let [args (map ->expr args)]
-                (reify
-                  IHasType
-                  (get-type [_])
-                  IExpression
-                  (expr-write [_]
-                    (str/join "->" (map expr-write args)))))))
+(defrecord RefExpression [x])
+(derive-expr RefExpression)
+(defmethod expr-write RefExpression
+  [{:keys [x]}]
+  (str  "(&" (expr-write x) ")"))
+(add-intrinsic 'ref (fn [x] (RefExpression. (->expr x))))
 
-(cop aget [x y]
-     (expr-write [_] (write-str x "[" y "]"))
-     IHasType
-     (get-type [_]
-               (lookup-type (type-dereferenced-type (get-type x)))))
+(defrecord DerefExpression [x])
+(derive-expr DerefExpression)
+(defmethod expr-write DerefExpression
+  [{:keys [x]}]
+  (str  "*" (expr-write x)))
+(add-intrinsic 'deref (fn [x] (DerefExpression. (->expr x))))
 
-(defrecord ArraySetExpression [target idx value]
-  IHasType
-  (get-type [_] (get-type target))
-  IExpression
-  (expr-write [_] (write-str target "[" idx "] = " value)))
-
-(cintrinsic aset [target idx value]
-            (if (is-block? value)
-              (wrap-last value (fn [x] (ArraySetExpression. target idx x)))
-              (ArraySetExpression. target idx value)))
-
-(cop ref [x]
-     (expr-write [_] (write-str "(&" x ")"))
-     IHasType
-     (get-type [_]))
-
-(cop deref [x]
-     (expr-write [_] (write-str "*" x))
-     IHasType
-     (get-type [_]))
-
-(csymbol-alias 'clojure.core/deref deref)
-
-(defrecord CVerbatim [args]
-  IHasType
-  (get-type [_])
-  IExpression
-  (expr-write [_]
-    (apply write-str args)))
-
-(cintrinsic* 'c*
+(defrecord CVerbatim [args])
+(derive-expr CVerbatim)
+(defmethod expr-write CVerbatim
+  [{:keys [args]}]
+  (apply str (map (fn [x] (if (string? x) x (expr-write x))) args)))
+(add-intrinsic 'c*
             (fn [& args]
               (CVerbatim.
                (map (fn [x]
                       (if (string? x) x (->expr x)))
                     args))))
 
+;;;; Statements
+
 (def ^:dynamic *indent* 0)
 
-(defn- indent [] (str/join (for [x (range *indent*)] "\t")))
+(defn indent [] (str/join (for [x (range *indent*)] "\t")))
 
-(defrecord Statement [expr noindent]
-  IExpression
-  (wrap-last [_ func]
-    (Statement. (func expr) noindent))
-  (expr-write [_]
-    (str (when-not noindent (indent)) (reduce-parens (expr-write expr)) ";"))
-  IHasType
-  (get-type [_] (get-type expr)))
+(defn is-block? [expr]
+  (let [cat (expr-category expr)]
+    (or (= :statement* cat) (= :block cat))))
 
+(defrecord Statement [expr noindent])
+(derive-expr Statement)
+(defmethod expr-wrap-last Statement
+  [{:keys [expr noindent]} func]
+  (Statement. (func expr) noindent))
+(defmethod expr-write Statement
+  [{:keys [expr noindent]}]
+  (str (when-not noindent (indent)) (reduce-parens (expr-write expr)) ";"))
+(defmethod get-type Statement
+  [{:keys [expr noindent]}] (get-type expr))
 (defmethod expr-category Statement [_] :statement)
 
 (defn cstatement [expr & {:keys [noindent]}]
@@ -1049,49 +438,50 @@
         expr
         (Statement. (->expr expr) noindent)))))
 
-(defn- wrap-statements [func statements]
+(defn wrap-statements [func statements]
   (conj (vec (drop-last statements))
-        (wrap-last (last statements) func)))
+        (expr-wrap-last (last statements) func)))
 
-(defrecord Statements [statements]
-  IExpression
-  (expr-write [_] (str/join "\n" (map expr-write statements)))
-  (wrap-last [_ func]
-    (Statements.
-     (wrap-statements func statements)))
-  IHasType
-  (get-type [_] (get-type (last statements))))
-
+(defrecord Statements [statements])
+(derive-expr Statements)
+(defmethod expr-write Statements
+  [{:keys [statements]}]
+  (str/join "\n" (map expr-write statements)))
+(defmethod expr-wrap-last Statements
+  [{:keys [statements]} func]
+  (Statements.
+   (wrap-statements func statements)))
+(defmethod get-type Statements
+  [{:keys [statements]}]
+  (get-type (last statements)))
 (defmethod expr-category Statements [_] :statement*)
 
-(defn- cstatements [statements]
+(defn cstatements [statements]
   (Statements. (doall (map cstatement (remove nil? statements)))))
 
-(defrecord CaseExpression [test cases]
-  IHasType
-  (get-type [_])
-  IExpression
-  (expr-write [_]
-    (let [cases
-          (binding [*indent* (inc *indent*)]
-            (for [[expr block] cases]
-              (if block
-                (let [block (binding [*indent* (inc *indent*)]
-                              (expr-write block))]
-                  (str (indent) "case " (expr-write expr) ":\n" block "\n" (indent) "break;\n"))
-                (str (indent) "default:" (expr-write expr) "\n" (indent) "break;\n"))))]
-      (str "switch(" (expr-write test) ") {\n" (str/join "\n" cases) (indent) "\n}")))
-  (wrap-last [_ func]
-    (CaseExpression.
-     test
-     (for [[expr block] cases]
-       (if block
-         [expr (wrap-last block func)]
-         [(wrap-last expr func)])))))
-
+(defrecord CaseExpression [test cases])
+(derive-expr CaseExpression)
+(defmethod expr-write CaseExpression
+  [{:keys [test cases]}]
+  (let [cases
+        (binding [*indent* (inc *indent*)]
+          (for [[expr block] cases]
+            (if block
+              (let [block (binding [*indent* (inc *indent*)]
+                            (expr-write block))]
+                (str (indent) "case " (expr-write expr) ":\n" block "\n" (indent) "break;\n"))
+              (str (indent) "default:" (expr-write expr) "\n" (indent) "break;\n"))))]
+    (str "switch(" (expr-write test) ") {\n" (str/join "\n" cases) (indent) "\n}")))
+(defmethod expr-wrap-last CaseExpression
+  [{:keys [test cases]} func]
+  (CaseExpression.
+   test
+   (for [[expr block] cases]
+     (if block
+       [expr (expr-wrap-last block func)]
+       [(expr-wrap-last expr func)]))))
 (defmethod expr-category CaseExpression [_] :statement)
-
-(cintrinsic*
+(add-intrinsic
  'case
  (fn [test & args]
    (let [test (->expr test)
@@ -1107,65 +497,47 @@
                  cases)]
      (CaseExpression. test cases))))
 
-(defrecord ReturnExpression [expr]
-  IHasType
-  (get-type [_] (get-type expr))
-  IExpression
-  (expr-write [_]
-    (if expr
-      (if-let [expr (expr-write expr)]
-        (str "return " (reduce-parens expr))
-        "return")
-      "return")))
-
-(derive ReturnExpression ::ReturnExpression)
-
-(cintrinsic*
+(defrecord ReturnExpression [expr])
+(derive-expr ReturnExpression)
+(defmethod get-type ReturnExpression
+  [{:keys [expr]}]
+  (get-type expr))
+(defmethod expr-write ReturnExpression
+  [{:keys [expr]}]
+  (if expr
+    (if-let [expr (expr-write expr)]
+      (str "return " (reduce-parens expr))
+      "return")
+    "return"))
+(add-intrinsic
  'return
  (fn
    ([] (ReturnExpression. nil))
    ([expr]
       (let [expr (->expr expr)]
-        (if (is-block? expr)
-          (wrap-last expr (fn [x] (ReturnExpression. x)))
-          (ReturnExpression. expr))))))
-
-;; (defn cblock [statements]
-;;   (str (indent) "{\n"
-;;        (binding [*indent* (inc *indent*)]
-;;          (cstatements statements))
-;;        "\n" (indent) "}"))
-
-;; (defn child-block [statements]
-;;   (let [nsts (count statements)]
-;;                      (cond
-;;                       (= 0 nsts) "{ }"
-;;                       ;; (= 1 nsts) (binding [*indent* (inc *indent*)]
-;;                       ;;              (cstatement (first statements)))
-;;                       :default (cblock statements))))
+        (expr-wrap-last expr (fn [x] (ReturnExpression. x)))))))
 
 (declare cblock)
 
-(defrecord IfExpression [expr then else]
-  IHasType
-  (get-type [_])
-  IExpression
-  (expr-write [_]
-    (str (indent)
-         "if(" (reduce-parens (expr-write expr)) ")\n"
-         (expr-write then)
-         (when else
-           (str "\n" (indent) "else\n"
-                (expr-write else)))))
-  (wrap-last [_ func]
-    (IfExpression.
-     expr
-     (wrap-last then func)
-     (when else (wrap-last else func)))))
-
+(defrecord IfExpression [expr then else])
+(derive-expr IfExpression)
+(defmethod expr-write IfExpression
+  [{:keys [expr then else]}]
+  (str (indent)
+       "if(" (reduce-parens (expr-write expr)) ")\n"
+       (expr-write then)
+       (when else
+         (str "\n" (indent) "else\n"
+              (expr-write else)))))
+(defmethod expr-wrap-last IfExpression
+  [{:keys [expr then else]} func]
+                (IfExpression.
+                 expr
+                 (expr-wrap-last then func)
+                 (when else (expr-wrap-last else func))))
 (defmethod expr-category IfExpression [_] :statement*)
 
-(cintrinsic* 'if
+(add-intrinsic 'if
              (fn
                ([expr then]
                   (IfExpression. (->expr expr)
@@ -1176,59 +548,57 @@
                                 (cblock then)
                                 (cblock else)))))
 
-(defrecord DeclExpression [var-type var-name init-expr]
-  IHasType
-  (get-type [_] var-type)
-  IExpression
-  (expr-write [_] (str (type-write-decl-expr var-type var-name) "=" (when init-expr (expr-write init-expr)))))
+(defrecord DeclExpression [var-type var-name init-expr])
+(derive-expr DeclExpression)
+(defmethod get-type DeclExpression
+  [{:keys [var-type]}]
+  var-type)
+(defmethod expr-write DeclExpression
+  [{:keys [var-type var-name init-expr]}] (str (type-write-decl-expr var-type var-name) "=" (when init-expr (expr-write init-expr))))
 
-(defrecord BlockExpression [statements]
-  IHasType
-  (get-type [_] (get-type (last statements)))
-  IExpression
-  (wrap-last [_ func]
-    (BlockExpression.
-     (wrap-statements func statements)))
-  (expr-write [_]
-    (str (indent) "{\n"
+(defrecord BlockExpression [statements])
+(derive-expr BlockExpression)
+(defmethod get-type BlockExpression
+  [{:keys [statements]}]
+  (get-type (last statements)))
+(defmethod expr-wrap-last BlockExpression
+  [{:keys [statements]} func]
+  (BlockExpression.
+   (wrap-statements func statements)))
+(defmethod expr-write BlockExpression
+  [{:keys [statements]}]
+  (str (indent) "{\n"
        (binding [*indent* (inc *indent*)]
          (str/join "\n" (map expr-write statements)))
-       "\n" (indent) "}")))
-
+       "\n" (indent) "}"))
 (defmethod expr-category BlockExpression [_] :block)
 
 (defn- cblock [& statements]
   (BlockExpression. (doall (map cstatement (remove nil? statements)))))
 
-(cintrinsic* 'do cblock)
+(add-intrinsic 'do cblock)
 
-(defrecord ForStatement [init-expr test-expr each-expr body]
-    IHasType
-    (get-type [_])
-    IExpression
-    (expr-write [_]
-      (str (indent) "for("
-           (reduce-parens (expr-write init-expr)) "; "
-           (reduce-parens (expr-write test-expr)) "; "
-           (reduce-parens (expr-write each-expr)) ")\n"
-           (expr-write body)))
-    (wrap-last [_ func] (throw (Exception. "Cannot take value of for statement"))))
-
+(defrecord ForStatement [init-expr test-expr each-expr body])
+(derive-expr ForStatement)
+(defmethod expr-write ForStatement
+  [{:keys [init-expr test-expr each-expr body]}]
+  (str (indent) "for("
+       (reduce-parens (expr-write init-expr)) "; "
+       (reduce-parens (expr-write test-expr)) "; "
+       (reduce-parens (expr-write each-expr)) ")\n"
+       (expr-write body)))
+(defmethod expr-wrap-last ForStatement
+  [_ _] (throw (Exception. "Cannot take value of for statement")))
 (defmethod expr-category ForStatement [_] :statement)
 
-(defrecord CommaExpression [expressions]
-  IHasType
-  (get-type [_])
-  IExpression
-  (expr-write [_] (str/join ", " (map expr-write expressions))))
-
+(defrecord CommaExpression [expressions])
+(derive-expr CommaExpression)
+(defmethod expr-write  CommaExpression [{:keys [expressions]}] (str/join ", " (map expr-write expressions)))
 (defmethod expr-category CommaExpression [_] :statement)
 
-(defrecord NopExpression []
-  IHasType
-  (get-type [_])
-  IExpression
-  (expr-write [_]))
+(defrecord NopExpression [])
+(derive-expr NopExpression)
+(defmethod expr-write NopExpression [_])
 
 (defn- wrap-for-expressions [form]
   (cond
@@ -1239,7 +609,7 @@
    :default
    (->expr form)))
 
-(cintrinsic* 'for
+(add-intrinsic 'for
              (fn [init test each & body]
                (let [body (apply cblock body)]
                  (ForStatement.
@@ -1248,18 +618,16 @@
                   (wrap-for-expressions each)
                   body))))
 
-(defrecord WhileStatement [test-expr body]
-    IHasType
-    (get-type [_])
-    IExpression
-    (expr-write [_]
-      (str (indent) "while(" (reduce-parens (expr-write test-expr)) ")\n"
-           (expr-write body)))
-    (wrap-last [_ func] (throw (Exception. "Cannot take value of while statement"))))
-
+(defrecord WhileStatement [test-expr body])
+(derive-expr WhileStatement)
+(defmethod expr-write WhileStatement
+  [{:keys [test-expr body]}]
+  (str (indent) "while(" (reduce-parens (expr-write test-expr)) ")\n"
+       (expr-write body)))
+(defmethod expr-wrap-last WhileStatement [_ _] (throw (Exception. "Cannot take value of while statement")))
 (defmethod expr-category WhileStatement [_] :statement)
 
-(cintrinsic* 'while
+(add-intrinsic 'while
              (fn [test & body]
                (let [body (apply cblock body)]
                  (WhileStatement.
@@ -1267,112 +635,31 @@
                   body))))
 
 
-(defrecord BreakStatement []
-  IHasType
-  (get-type [_])
-  IExpression
-  (expr-write [_] "break"))
+(defrecord BreakStatement [])
+(derive-expr BreakStatement)
+(defmethod expr-write BreakStatement [_] "break")
+(add-intrinsic 'break (fn [] (BreakStatement.)))
 
-(cintrinsic break [] (BreakStatement.))
+(defrecord ContinueStatement [])
+(derive-expr ContinueStatement)
+(defmethod expr-write ContinueStatement [_] "continue")
+(add-intrinsic 'break (fn [] (ContinueStatement.)))
 
-(defrecord ContinueStatement []
-  IHasType
-  (get-type [_])
-  IExpression
-  (expr-write [_] "continue"))
-
-(cintrinsic continue [] (ContinueStatement.))
-
-(defrecord LabelStatement [label]
-  IHasType
-  (get-type [_])
-  IExpression
-  (expr-write [_] (str (name label) ":")))
-
+(defrecord LabelStatement [label])
+(derive-expr LabelStatement)
+(defmethod expr-write LabelStatement
+  [{:keys [label]}]
+  (str (name label) ":"))
 (defmethod expr-category LabelStatement [_] :statement)
+(add-intrinsic 'label (fn [x] (LabelStatement. x)))
 
-(cintrinsic* 'label (fn [x] (LabelStatement. x)))
-
-(defrecord GotoExpression [label]
-  IHasType
-  (get-type [_])
-  IExpression
-  (expr-write [_] (str "goto " (name label))))
-
-(cintrinsic* 'goto (fn [x] (GotoExpression. x)))
-
-(defn- add-local [decl]
-  (let [var-name (name decl)]
-    (assert *locals* "No local variable context for let expression")
-    (assert (not (get *locals* var-name))
-            (str "Local variable named " var-name " already defined"))
-    (set! *locals* (assoc *locals* var-name decl))
-    (set! *local-decls* (conj *local-decls* decl))))
-
-(cintrinsic*
- 'let
- (fn [& forms]
-   (let [let-forms (first forms)
-         body-forms (rest forms)]
-     (assert (even? (count let-forms)) "let expression must contain an even number of forms")
-     (cstatements
-      (concat
-       (for [[decl expr-form] (partition 2 let-forms)]
-         (let [init-expr (->expr expr-form)
-               explicit-tag (:tag (meta decl))
-               decl-type (if explicit-tag
-                           explicit-tag
-                           (get-type init-expr))]
-           (assert decl-type (str "unable to infer type for let binding: " decl " " expr-form))
-           (let [decl-type (lookup-type decl-type)
-                 decl-expr (create-var-decl
-                            (name decl)
-                            decl-type)]
-             (add-local decl-expr)
-             (if (is-block? init-expr)
-               (wrap-last init-expr (fn [x] (set_BANG_Expression. (VariableRefExpression. decl-expr) x)))
-               (set_BANG_Expression. (VariableRefExpression. decl-expr) init-expr)))))
-       (map cstatement body-forms))))))
-
-(defn get-var-type-tag [metadata]
-  (let [tag (:tag metadata)]
-    (if (string? tag) (keyword tag) tag)))
-
-(defn- declare-fn [sym]
-  (if-let [decl-type (get-var-type-tag (meta sym))]
-    (do
-      (add-local
-       (create-var-decl (name sym) decl-type))
-      (NopExpression.))
-     (throw (ArgumentException.
-             (str "Unable to infer type for declare expression of symbol" sym)))))
-
-(cintrinsic* 'declare declare-fn)
-
-(def ^:private set!-fn (get @cintrinsics 'set!))
-
-(cintrinsic*
- 'def
- (fn def-fn [sym init-expr]
-   (declare-fn sym)
-   (set!-fn sym init-expr)))
-
-;;;;; Declarations
-
-(defrecord AnonymousFunctionCallExpression [func-name args])
-(defmethod expr-write AnonymousFunctionCallExpression
-  [{:keys [func-name args]}]
-  (str (name func-name)
-       "(" (str/join "," (map expr-write args)) ")"))
-
-(defrecord ComputedFunctionCallExpression [func-expr args])
-(defmethod expr-write ComputedFunctionCallExpression
-  [{:keys [func-expr args]}]
-  (str (expr-write func-expr)
-       "(" (str/join "," (map expr-write args)) ")"))
-(defmethod get-type ComputedFunctionCallExpression
-  [{:keys [func-expr]}]
-  (get-type func-expr))
+(defrecord GotoStatement [label])
+(derive-expr GotoStatement)
+(defmethod expr-write GotoStatement
+  [{:keys [label]}]
+  (str "goto" (name label)))
+(defmethod expr-category GotoStatement [_] :statement)
+(add-intrinsic 'goto (fn [x] (GotoStatement. x)))
 
 (defrecord VariableRefExpression [variable])
 (defmethod expr-write VariableRefExpression
@@ -1397,94 +684,141 @@
   [this]
   (VariableRefExpression. this))
 
-(defrecord AnonymousVariableRefExpression [var-name])
-(defmethod expr-write AnonymousVariableRefExpression
-  [{:keys [var-name]}] (get-name var-name))
+(def ^:private set!-fn (get @cintrinsics "set!"))
 
-(defrecord LocalVariableScope [parent-scope local-decls local-syms])
-(derive-scope LocalVariableScope)
-(defmethod scope-lookup-symbol LocalVariableScope
-  [{:keys [parent-scope local-syms]} sym]
-  (or (get local-syms sym)
-      (scope-lookup-symbol parent-scope)))
-(defmethod scope-lookup-type LocalVariableScope
-  [{:keys [parent-scope local-syms]} sym]
-  (or (get local-syms sym)
-      (scope-lookup-type parent-scope)))
-(defmethod scope-form->expr LocalVariableScope
-  [{:keys [parent-scope]} form]
-  (scope-form->expr parent-scope form))
+(add-intrinsic
+ 'let
+ (fn [& forms]
+   (let [let-forms (first forms)
+         body-forms (rest forms)]
+     (assert (even? (count let-forms)) "let expression must contain an even number of forms")
+     (cstatements
+      (concat
+       (for [[decl expr-form] (partition 2 let-forms)]
+         (let [init-expr (->expr expr-form)
+               explicit-tag (:tag (meta decl))
+               decl-type (if explicit-tag
+                           explicit-tag
+                           (get-type init-expr))]
+           (assert decl-type (str "unable to infer type for let binding: " decl " " expr-form))
+           (let [decl-type (lookup-type decl-type)
+                 decl-expr (VariableDeclaration.
+                            (name decl)
+                            (name decl-type))]
+             (scope-add (get-scope) decl-expr)
+             (if (is-block? init-expr)
+               (expr-wrap-last init-expr (fn [x] (AssignOp. "=" (VariableRefExpression. decl-expr) x)))
+               (AssignOp. "=" (VariableRefExpression. decl-expr) init-expr)))))
+       (map cstatement body-forms))))))
 
-(defrecord CMacro [name func]
+(defn get-var-type-tag [metadata]
+  (let [tag (:tag metadata)]
+    (if (string? tag) (keyword tag) tag)))
+
+(defn- declare-fn [sym]
+  (if-let [decl-type (get-var-type-tag (meta sym))]
+    (do
+      (scope-add
+       (get-scope)
+       (VariableDeclaration. (name sym) decl-type))
+      (NopExpression.))
+     (throw (ex-info
+             (str "Unable to infer type for declare expression of symbol" sym)
+             {:type ::declaration-type-inference-error
+              :symbol sym}))))
+
+(add-intrinsic 'declare declare-fn)
+
+(add-intrinsic
+ 'def
+ (fn def-fn [sym init-expr]
+   (declare-fn sym)
+   (set!-fn sym init-expr)))
+
+(defn get-intrinsics []
+  @cintrinsics)
+
+(defrecord StaticArrayType [element-type-name array-length]
   clojure.lang.Named
-  (getName [_] name))
-(defmethod list->expr CMacro [{:keys [func]} args]
-  (apply func args))
+  (getName [_] (str element-type-name "[" array-length "]")))
+(derive-type StaticArrayType)
+(defmethod type-write-decl-expr StaticArrayType
+  [{:keys [element-type-name array-length]} var-name]
+  (str (type-write-decl-expr (lookup-type element-type-name) var-name)
+       "[" array-length "]"))
+(defmethod type-is-reference? StaticArrayType [_] true)
+(defmethod type-write StaticArrayType
+  [{:keys [element-type-name array-length]}]
+  (str (type-write (lookup-type element-type-name)) "[" array-length "]"))
+(defmethod type-dereferenced-type StaticArrayType
+  [{:keys [element-type-name]}]
+  (lookup-type element-type-name))
 
-(defrecord FunctionParameter [param-name param-type]
-  clojure.lang.Named
-  (getName [_] param-name))
-(defmethod get-type FunctionParameter
-  [{:keys [param-type]}]
-  (lookup-type param-type))
-(defmethod expr-write FunctionParameter
-  [{:keys [param-type param-name]}]
-  (type-write-decl-expr (lookup-type param-type) param-name))
-(defmethod expr-category FunctionParameter [_] :local)
+(defn parse-static-array-type [sym]
+  (let [type-name (str sym)]
+    (when-let [[_ type-name array-len] (re-matches #"(.*)!([0-9]*)" type-name)]
+      (let [underlying-type (lookup-type sym)
+            array-len (when-not (empty? array-len)
+                        (int array-len))]
+        (if array-len
+          (StaticArrayType. underlying-type array-len)
+          (PointerType. underlying-type))))))
 
-(defn- write-function-type [{:keys [return-type params]}
-                            pointer-depth name?]
-  (str (type-write (lookup-type return-type)) " ("
-       (apply str (repeat pointer-depth "*"))
-       name? ")("
-       (str/join ", " (map expr-write params)) ")"))
+(defn parse-pointer-type [sym]
+  (let [type-name (str sym)]
+    (when (= (last type-name) \*)
+      (PointerType.
+       (lookup-type (symbol (subs type-name 0 (dec (count type-name))))
+                    :throw true)))))
 
-(defrecord FunctionType [type-name return-type params]
+(defrecord AnonymousFieldAccessExpression [instance-expr member-name pointer-depth])
+(defmethod expr-write AnonymousFieldAccessExpression
+  [{:keys [instance-expr member-name pointer-depth]}]
+  (let [prefix-pointer (when (>= pointer-depth 2)
+                         (- pointer-depth 2))
+        pointer-depth (if prefix-pointer 1
+                          pointer-depth)]
+    (str
+     (when prefix-pointer
+       (apply str "(" (repeat prefix-pointer "*")))
+     (expr-write instance-expr)
+     (when prefix-pointer ")")
+     (case pointer-depth
+       0 "."
+       1 "->")
+     (name member-name))))
+
+(defrecord AnonymousType [type-name]
   clojure.lang.Named
   (getName [_] type-name))
-(derive-ctype FunctionType)
-(defmethod type-is-function? FunctionType [_] true)
-(defmethod type-write-decl-expr FunctionType
-  ([this var-name]
-    (write-function-type this 0 var-name))
-  ([this var-name pointer-depth]
-    (write-function-type this pointer-depth var-name)))
-(defmethod type-write FunctionType
-  [this]
-  (write-function-type this 0 nil))
+(derive-type AnonymousType)
+(defmethod type-create-field-access-expr AnonymousType
+  ([this instance-expr member-name]
+    (type-create-field-access-expr this instance-expr member-name 0))
+  ([this instance-expr member-name pointer-depth]
+    (AnonymousFieldAccessExpression. instance-expr member-name pointer-depth)))
 
-(defn- write-function-signature [{:keys [function-name function-type] :as decl} ]
-  (let [{:keys [return-type params]} function-type]
-    (str
-     (apply-hook :before-function-signature decl)
-     (type-write (lookup-type return-type)) " "
-     function-name "(" (str/join ", " (map expr-write params)) ")")))
+(defrecord CLanguageScope [])
 
-(defrecord FunctionDeclaration [function-name function-type body referenced-decls locals]
-  clojure.lang.Named
-  (getName [this] function-name))
-(defmethod get-type FunctionDeclaration
-  [{:keys [function-type]}]
-  function-type)
-(defmethod decl-write FunctionDeclaration
-  [{:keys [function-name function-type body referenced-decls locals]}]
-  (or (apply-hook :alternate-function-declaration this)
-      (str
-       (when-let [doc (:doc (meta this))]
-         (str "/**\n" 
-              (apply str (map #(str "* " % "\n") (str/split-lines doc)))
-              "*/\n"))
-       (write-function-signature this) ";")))
-(defmethod decl-write-impl FunctionDeclaration
-  [{:keys [function-name function-type body referenced-decls locals]}]
-  (str (write-function-signature this) "\n"
-       (binding [*scope* locals]
-         (expr-write body))))
+(defmethod scope-lookup-symbol
+  CLanguageScope
+  [_ sym]
+  (get @cintrinsics (name sym)))
 
-(defrecord RawCMacro [macro-name body]
-  clojure.lang.Named
-  (getName [_] macro-name))
-(defmethod decl-write RawCMacro [{:keys [macro-name body]}] (str "#define " macro-name " " body "\n"))
-(defmethod list->expr RawCMacro
-  [{:keys [macro-name]} args]
-  (AnonymousFunctionCallExpression. macro-name (map ->expr args)))
+(defmethod scope-lookup-type
+  CLanguageScope
+  [_ type-name]
+  (cond
+   (is-type? type-name) type-name
+   (keyword? type-name) (AnonymousType. (name type-name))
+   :default
+   (or
+    (parse-static-array-type type-name)
+    (parse-pointer-type type-name)
+    (get @primitive-types (name type-name)))))
+
+(defmethod scope-form->expr
+  CLanguageScope
+  [_ form]
+  (cform->expr form))
+
