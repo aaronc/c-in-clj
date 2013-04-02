@@ -126,7 +126,10 @@
   (or
    (cmember-access-list->expr sym args)
    (when-let [resolved (lookup-symbol sym)]
-     (->expr (list->expr resolved args)))
+     (if-let [func (get-method list->expr resolved)]
+       (->expr (func resolved args))
+       (when (::macro (meta resolved))
+         (->expr (apply resolved args)))))
    (throw (ex-info (str "Don't know how to handle list symbol " sym)
                    {:type ::list-parse-exception
                     :symbol sym
@@ -170,7 +173,10 @@
 
 (def ^:private cintrinsics (atom {}))
 
-(defn- add-intrinsic [sym f] (swap! cintrinsics assoc (name sym) f))
+(defn- add-intrinsic [sym f]
+  (swap! cintrinsics
+         assoc (name sym)
+         (with-meta f {::macro true})))
 
 (defn reduce-parens [^String expr]
   (when expr

@@ -134,7 +134,7 @@ get-name, get-name, sym->expr, list->expr")
 
 (def ^:private scopes-by-ns (atom {}))
 
-(defn get-ns-scope [] (get scopes-by-ns *ns*))
+(defn get-ns-scope [] (get @scopes-by-ns *ns*))
 
 (defn get-scope [] (or *scope* (get-ns-scope)))
 
