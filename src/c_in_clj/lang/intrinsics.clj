@@ -148,7 +148,8 @@
 (defrecord AnonymousVariableRefExpression [var-name])
 (derive-expr AnonymousVariableRefExpression)
 (defmethod expr-write AnonymousVariableRefExpression
-  [{:keys [var-name]}] (get-name var-name))
+  [{:keys [var-name]}]
+  (name var-name))
 
 (defn cform->expr [form]
   (cond
@@ -283,7 +284,7 @@
   [{:keys [sym args]}]
   (if (= 1 (count args))
     (str (name sym) (expr-write (first args)))
-             (str "(" (str/join ~(str " " sym " ") (map expr-write args)) ")"))  )
+             (str "(" (str/join (str " " sym " ") (map expr-write args)) ")"))  )
 (defmethod get-type NOperation
   [{:keys [sym args]}]
   (apply get-bin-op-type args))
@@ -297,14 +298,14 @@
 (derive-expr NCompOperation)
 (defmethod expr-write NCompOperation
   [{:keys [sym args]}]
-  (str "(" (str/join ~(str " " sym " ") (map expr-write args)) ")")  )
+  (str "(" (str/join (str " " sym " ") (map expr-write args)) ")")  )
 (defmethod get-type NCompOperation [_] 'bool)
 
 (defn parse-comp*op [sym & args]
   (NCompOperation. sym (doall (map ->expr args))))
 
 (add-intrinsic 'or (partial parse-comp*op "||"))
-(add-intrinsic 'and (partial parse-comp*op "&"))
+(add-intrinsic 'and (partial parse-comp*op "&&"))
 
 (defrecord UnaryOperation [func x])
 (derive-expr UnaryOperation)
