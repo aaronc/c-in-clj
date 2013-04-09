@@ -2,8 +2,10 @@
   (:import [System.Diagnostics Process ProcessStartInfo]
            [System.IO Path File Directory]
            [System.Runtime.InteropServices Marshal GCHandle GCHandleType])
-  (:require [clojure.string :as str])
-  (:use [c-in-clj.core]
+  (:require [clojure.string :as str]
+            [c-in-clj.platform :as platform])
+  (:use [c-in-clj.lang]
+        [c-in-clj.runtime]
         [clojure.clr pinvoke emit]))
 
 (dllimports "kernel32.dll"
@@ -131,7 +133,7 @@
                    proc-name (get-proc-name decl)
                    new-fn-ptr (GetProcAddress new-dll-handle proc-name)]
                (when (= IntPtr/Zero new-fn-ptr)
-                 (throw (Exception. (str "Unable to load " proc-name))))
+                 (throw (Exception. (str "Unable to load " proc-name " from " dll-path))))
                (println "Loaded" proc-name "at" new-fn-ptr)
                (let [new-invoker (make-invoker new-fn-ptr decl)]
                  (if-let [{:keys [fn-ptr-ptr cur-fn-ptr cur-dll-info cur-decl invoker] :as sym-ref} (get @compiled-symbols sym-name)]
@@ -226,7 +228,7 @@
 (defn- init-cl-bat [temp-output-path msvc-path]
   (let [cl-bat-path (Path/Combine temp-output-path "cl.bat")
         x64 (= IntPtr/Size 8)]
-    (ensure-directory temp-output-path)
+    (platform/ensure-directory temp-output-path)
     (File/WriteAllText
      cl-bat-path
      (String/Format
@@ -247,9 +249,10 @@
                opts)]
     (MSVCCompileContext. (atom {}) (atom #{}) nil opts)))
 
-(defn- dll-load-symbol [{:keys [dll-name] :as loader} package-name {:keys [name ret-type params type var-type] :as sym-info}]
+(defn- dll-load-symbol [{:keys [dll-name] :as loader} package-name {:keys [name type func-type var-type] :as sym-info}]
   (if (= type :function)
-    (let [clr-ret (get-clr-type ret-type)
+    (let [{:keys [return-type params]} func-type
+          clr-ret (get-clr-type return-type)
           clr-params (get-clr-params params)]
       (dllimport* dll-name name clr-ret clr-params))
     (throw (ex-info (str "Don't know how to load symbol " name " of type " type) sym-info))))
