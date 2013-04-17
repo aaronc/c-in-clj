@@ -829,3 +829,8 @@
   [_ form]
   (cform->expr form))
 
+(def default-c-preamble
+  "#include <stddef.h>\n#include <stdint.h>\n#include <stdbool.h>\n")
+
+(def default-cpp-preamble
+  "#include <cstddef>\n#include <cstdint>\n")

@@ -1,29 +1,31 @@
-(ns c-in-clj.lang.api
-  "The idea here is to create an API that will let us define the elements of
-a language like C in a very flexible, extensible way.  This API would probably
-be sufficient to define many other languages besides C.
+;;   "The idea here is to create an API that will let us define the elements of
+;; a language like C in a very flexible, extensible way.  This API would probably
+;; be sufficient to define many other languages besides C.
 
-It consists of three basic type classes type, expr (expression)
-and decl (declaration). It uses almost exclusively Clojure multimethods and
-hierarchies defined using the derive function.  Each type class follows the
-following pattern:
-  For the type class X:
-   * there are functions derive-X and is-X? which both allow us to derive
-     some other class from X and test if a given object derives from X
-     (ex. derive-type and is-type?)
-   * any function prefixed with X- is a multimethod which extends the
-     functionality of types derived from X.
-   * functions which include X in their name but do not start with X,
-     are helper functions
+;; It consists of three basic type classes type, expr (expression)
+;; and decl (declaration). It uses almost exclusively Clojure multimethods and
+;; hierarchies defined using the derive function.  Each type class follows the
+;; following pattern:
 
-It is suggested that you use defrecords as the concrete type, expr, and decl
-types.
+;; For the type class X:
+;;  * there are functions derive-X and is-X? which both allow us to derive
+;; some other class from X and test if a given object derives from X
+;; (ex. derive-type and is-type?)
+;;  * any function prefixed with X- is a multimethod which extends the
+;; functionality of types derived from X.
+;;  * functions which include X in their name but do not start with X,
+;; are helper functions
 
-These multimethods can be defined on any type, expr, or decl:
-get-name, get-name, sym->expr, list->expr")
+;; It is suggested that you use defrecords as the concrete type, expr, and decl
+;; types.
+
+;; These multimethods can be defined on any type, expr, or decl:
+;; get-name, get-name, sym->expr, list->expr"
+
+(ns c-in-clj.lang.api)
 
 
-(defn- is-an-instance? [x t] (isa? (type x) t))
+(defn is-an-instance? [x t] (isa? (type x) t))
 
 ;; Methods which can apply to all c-in-clj elements
 
