@@ -348,6 +348,20 @@
 
 (def null-literal (NullLiteral.))
 
+(defrecord VariableRefExpression [variable]
+  IExpression
+  (write-expr [_] (name (lookup-symbol variable)))
+  IHasType
+  (get-type [_] (get-type (lookup-symbol variable))))
+
+(defrecord ComputedFunctionCallExpression [func-expr args]
+  IExpression
+  (write-expr [this]
+    (str (write-expr func-expr)
+         "(" (str/join "," (map write-expr args)) ")"))
+  IHasType
+  (get-type [this] (get-type func-expr)))
+
 (defrecord FunctionParameter [param-name param-type]
   clojure.lang.Named
   (getName [_] param-name)
@@ -441,14 +455,6 @@
   IHasType
   (get-type [this]))
 
-(defrecord ComputedFunctionCallExpression [func-expr args]
-  IExpression
-  (write-expr [this]
-    (str (write-expr func-expr)
-         "(" (str/join "," (map write-expr args)) ")"))
-  IHasType
-  (get-type [this] (get-type func-expr)))
-
 (defrecord VariableDeclaration [var-name var-type init]
   clojure.lang.Named
   (getName [_] var-name)
@@ -461,12 +467,6 @@
            (when-let [init (or init (when requires-initialization var-type
                                      (default-initializer var-type)))]
              (str " = " (write-expr init)))))))
-
-(defrecord VariableRefExpression [variable]
-  IExpression
-  (write-expr [_] (name (lookup-symbol variable)))
-  IHasType
-  (get-type [_] (get-type (lookup-symbol variable))))
 
 (defmethod expand-list-args VariableDeclaration
   [{:keys [var-name]} args]
