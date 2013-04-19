@@ -269,31 +269,44 @@
 (declare lookup-type)
 
 (defn- static-array-type? [type-name]
-  (when-let [[_ type-name array-len] (re-matches #"(.*)!([0-9]*)" type-name)]
-    (let [underlying-type (lookup-type type-name)
-          array-len (when-not (empty? array-len)
-                      (int array-len))]
+  (when-let [[_ underlying-type-name array-len] (re-matches #"(.*)!([^!]*)"
+                                                            (name type-name))]
+    (let [underlying-type-name (with-meta
+                                 (symbol underlying-type-name)
+                                 (meta type-name))
+          underlying-type (lookup-type underlying-type-name)]
       (if array-len
         (StaticArrayType. underlying-type array-len)
         (PointerType. underlying-type)))))
 
-(defn lookup-type [type-name]
+(defn lookup-type [type-sym]
   (let [resolved-type
         (cond
-         (isa? (type type-name) ::Type) type-name
-         (keyword? type-name) (AnonymousType. (name type-name))
+         (isa? (type type-sym) ::Type) type-sym
+         (keyword? type-sym) (lookup-type
+                               (with-meta
+                                 (symbol (namespace type-sym)
+                                         (name type-sym))
+                                 {:anonymous true}))
          :default
-         (let [type-name (name type-name)]
+         (let [type-meta (meta type-sym)
+               anonymous (:anonymous type-meta)
+               type-name (name type-sym)]
            (or
-            (static-array-type? type-name)
+            (static-array-type? type-sym)
             (if-let [primitive (get @primitive-types type-name)]
               primitive
               (if-let [alias (get @type-aliases type-name)]
                 (lookup-type alias)
                 (if (= (last type-name) \*)
-                  (PointerType. (lookup-type (subs type-name 0 (dec (count type-name)))))
-                  (when-let [typ (resolve-symbol (get-package) type-name)]
-                    (when (isa? (type typ) ::Type) typ))))))))]
+                  (let [child-type-name (subs type-name 0 (dec (count type-name)))
+                        child-type-sym (with-meta (symbol child-type-name) type-meta)
+                        child-type (lookup-type child-type-sym)]
+                    (PointerType. child-type))
+                  (if anonymous
+                    (AnonymousType. type-name)
+                    (when-let [typ (resolve-symbol (get-package) type-name)]
+                      (when (isa? (type typ) ::Type) typ)))))))))]
     (add-referenced-decl resolved-type)
     resolved-type))
 
@@ -345,9 +358,15 @@
 
 (defmethod expr-category FunctionParameter [_] :local)
 
-(defn- write-function-type [{:keys [return-type params]}
+(defmethod expand-list-args FunctionParameter
+  [{:keys [param-name]} args]
+  (ComputedFunctionCallExpression. (VariableRefExpression. param-name) (map cexpand args)))
+
+(defn- write-function-type [{:keys [return-type params] :as fn-type}
                             pointer-depth name?]
-  (str (write-type (lookup-type return-type)) " ("
+  (str (write-type (lookup-type return-type))
+       " ( "
+       (apply-hook :after-function-return-type fn-type)
        (apply str (repeat pointer-depth "*"))
        name? ")("
        (str/join ", " (map write-expr params)) ")"))
@@ -376,6 +395,7 @@
     (str
      (apply-hook :before-function-signature decl)
      (write-type (lookup-type return-type)) " "
+     (apply-hook :after-function-return-type function-type)
      function-name "(" (str/join ", " (map write-expr params)) ")")))
 
 (defrecord FunctionDeclaration [package function-name function-type body referenced-decls locals]
@@ -429,7 +449,7 @@
   IHasType
   (get-type [this] (get-type func-expr)))
 
-(defrecord VariableDeclaration [var-name var-type]
+(defrecord VariableDeclaration [var-name var-type init]
   clojure.lang.Named
   (getName [_] var-name)
   IHasType
@@ -438,18 +458,19 @@
   (write-expr [_]
     (let [var-type (lookup-type var-type)]
       (str (write-decl-expr var-type var-name)
-           (when-let [init (requires-initialization var-type)]
-             (str " = " (default-initializer var-type)))))))
-
-(defn- create-var-decl
-  ([var-name var-type]
-     (VariableDeclaration. var-name var-type)))
+           (when-let [init (or init (when requires-initialization var-type
+                                     (default-initializer var-type)))]
+             (str " = " (write-expr init)))))))
 
 (defrecord VariableRefExpression [variable]
   IExpression
   (write-expr [_] (name (lookup-symbol variable)))
   IHasType
   (get-type [_] (get-type (lookup-symbol variable))))
+
+(defmethod expand-list-args VariableDeclaration
+  [{:keys [var-name]} args]
+  (ComputedFunctionCallExpression. (VariableRefExpression. var-name) (map cexpand args)))
 
 (defrecord AnonymousVariableRefExpression [var-name]
   IExpression
@@ -1075,6 +1096,8 @@
   IExpression
   (write-expr [_]))
 
+(defmethod expr-category NopExpression [_] :statement)
+
 (defn- wrap-for-expressions [form]
   (cond
    (empty? form)
@@ -1170,9 +1193,10 @@
                            (get-type init-expr))]
            (assert decl-type (str "unable to infer type for let binding: " decl " " expr-form))
            (let [decl-type (lookup-type decl-type)
-                 decl-expr (create-var-decl
+                 decl-expr (VariableDeclaration.
                             (name decl)
-                            decl-type)]
+                            decl-type
+                            nil)]
              (add-local decl-expr)
              (if (is-block? init-expr)
                (wrap-last init-expr (fn [x] (set_BANG_Expression. (VariableRefExpression. decl-expr) x)))
@@ -1183,14 +1207,16 @@
   (let [tag (:tag metadata)]
     (if (string? tag) (keyword tag) tag)))
 
-(defn- declare-fn [sym]
-  (if-let [decl-type (get-var-type-tag (meta sym))]
-    (do
-      (add-local
-       (create-var-decl (name sym) decl-type))
-      (NopExpression.))
-     (throw (ArgumentException.
-             (str "Unable to infer type for declare expression of symbol" sym)))))
+(defn- declare-fn
+  ([sym] (declare-fn sym nil))
+  ([sym init]
+      (if-let [decl-type (get-var-type-tag (meta sym))]
+        (let [init (when init (cexpand init))]
+          (add-local
+           (VariableDeclaration. (name sym) decl-type init))
+          (NopExpression.))
+        (throw (ArgumentException.
+                (str "Unable to infer type for declare expression of symbol" sym))))))
 
 (cintrinsic* 'declare declare-fn)
 

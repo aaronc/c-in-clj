@@ -11,11 +11,12 @@
 (dllimports "kernel32.dll"
             (LoadLibrary IntPtr [String])
             (GetProcAddress IntPtr [IntPtr String])
-            (FreeLibrary nil [IntPtr]))
+            (FreeLibrary nil [IntPtr])
+            (SetDllDirectory Boolean [String]))
 
 (def default-msvc-path (Environment/ExpandEnvironmentVariables "%PROGRAMFILES(x86)%\\Microsoft Visual Studio 10.0\\VC"))
 
-(def default-msvc-args "kernel32.lib user32.lib gdi32.lib winspool.lib comdlg32.lib advapi32.lib shell32.lib ole32.lib oleaut32.lib uuid.lib odbc32.lib odbccp32.lib /EHs /Gz /LD")
+(def default-msvc-args "/MDd kernel32.lib user32.lib gdi32.lib winspool.lib comdlg32.lib advapi32.lib shell32.lib ole32.lib oleaut32.lib uuid.lib odbc32.lib odbccp32.lib /EHs /LD")
 
 (def ^:private dg-type-cache (atom {}))
 
@@ -77,9 +78,13 @@
                 :default t)]
     (Marshal/SizeOf (let [^Type t t] t))))
 
+(defn- is-var-args? [params]
+  (and (seq params)
+       (= (name (last params)) "...")))
+
 (defn- get-proc-name [decl]
   (if-let [{:keys [params]} (:function-type decl)]
-    (if (and (not (empty? params)) (= (name (last params)) "..."))
+    (if (is-var-args? params)
       (name decl)
       (let [clr-params (get-clr-params params)
             args-size (reduce + (map #(max (get-clr-type-size %) 4) clr-params))]
@@ -182,6 +187,13 @@
   before-function-signature
  [{:keys [cpp-mode]} expr]
  (str (when cpp-mode "extern \"C\" ") "__declspec(dllexport) "))
+
+(defhook
+  msvc-hooks
+  after-function-return-type
+ [{:keys [cpp-mode]} fn-type]
+ (when-not (is-var-args? (:params fn-type))
+   "__stdcall "))
 
 (defhook
   msvc-hooks

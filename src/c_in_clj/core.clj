@@ -72,6 +72,7 @@
     (binding [*referenced-decls* #{}]
       (let [func-type (parse-fn-params params func-name)
             params (:params func-type)]
+        (println func-type)
         (binding [*locals* (into {} (for [param params] [(name param) param]))
                   *local-decls* []]
           (let [func-metadata (meta func-name)
@@ -158,13 +159,14 @@
 (defn- compile-cfns [funcs]
   (do-compile-decls funcs #'parse-cfn #'load-cfn))
 
-(defn- parse-cdef [[var-name init-expr]]
+(defn- parse-cdef [[var-sym init-expr]]
   (let [package (get-package)
-        metadata (meta var-name)
-        var-name (name var-name)
-        var-type (get-var-type-tag var-name)
+        metadata (meta var-sym)
+        var-type (get-var-type-tag metadata)
+        var-name (name var-sym)
         init-expr (when init-expr (cexpand init-expr))
         var-decl (with-meta (->GlobalVariableDeclaration package var-name var-type init-expr) metadata)]
+    (println (meta var-sym))
     (add-declaration package var-decl)
     var-decl))
 
@@ -206,7 +208,7 @@
     `(let [func#
            (fn ~(symbol (str macro-name "-macro")) ~params
              (c-in-clj.lang/unqualify-symbols (do ~@body)))]
-       (c-in-clj.lang/cmacro* ~(name macro-name) func#))))
+       (c-in-clj.core/cmacro* ~(name macro-name) func#))))
 
 (defn cstruct* [struct-name members]
   (let [package (get-package)
