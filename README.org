@@ -295,23 +295,6 @@ for(i = 0, j = 0; i < x && j < y; ++i ++j)
 }
 #+END_SRC
 
-**** goto
-
-#+BEGIN_SRC clojure
-(do
- (label a)
-  (if (b) (goto a)))
-#+END_SRC
-
-#+BEGIN_SRC c
-{
- int x = 0;
- double y = 1.0;
- a(x, y);
- b(y, x);
-}
-#+END_SRC
-
 **** let
 #+BEGIN_SRC clojure
 (let [^int x 0
