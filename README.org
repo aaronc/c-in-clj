@@ -123,11 +123,11 @@ for redefining functions at the repl.  For instance we can do the
 following:
 
 #+BEGIN_SRC clojure
-user=> (cdefn test1 void [int32_t x int32_t y] (return (+ x y)))
-user=> (cdefn test2 void [] (test1 3 4))
+user=> (cdefn test1 ^int32_t [^int32_t x ^int32_t y] (return (+ x y)))
+user=> (cdefn test2 ^int32_t [] (test1 3 4))
 user=> (test2)
 7
-user=> (cdefn test1 void [int32_t x int32_t y] (return (* x y)))
+user=> (cdefn test1 ^int32_t [^int32_t x ^int32_t y] (return (* x y)))
 user=> (test2)
 12
 #+END_SRC
