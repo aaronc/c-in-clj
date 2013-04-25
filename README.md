@@ -143,42 +143,41 @@ not done carefully.
 
 | c-in-clj expression   | c equivalent     |
 |-----------------------|------------------|
-| (+ x y)               | x + y            |
-| (- x y)               | x - y            |
-| (* x y)               | x * y            |
-| (/ x y)               | x / y            |
-| (mod x y)             | x % y            |
-| (= x y)               | x == y           |
-| (not= x y)            | x != y           |
-| (< x y)               | x < y            |
-| (> x y)               | x > y            |
-| (<= x y)              | x <= y           |
-| (>= x y)              | x >= y           |
-| (or x y)              | x &#124;&#124; y |
-| (and x y)             | x && y         |
-| (bit-and x y)         | x & y          |
-| (bit-or x y)          | x &#124; y      |
-| (bit-xor x y)         | x ^ y          |
-| (bit-shift-left x y)  | x << y         |
-| (bit-shift-right x y) | x >> y        |
-| (set! x y)            | x = y          |
-| (and= x y)            | x &= )         |
-| (or= x y)             | x &#124;= y     |
-| (xor= x y)            | x ^= y         |
-| (inc x)               | ++x              |
-| (post-inc x)          | x++              |
-| (dec x)               | --x              |
-| (post-dec x)          | x--              |
-| (not x)               | !x               |
-| (bit-not x)           | ~x               |
-| (. x y)               | x.y              |
-| (-> x y)              | x->y             |
-| (ref x)               | &x               |
-| (deref x) *or* @x       | *x               |
-| (aget x i)            | x[i]             |
-| (aset x i z)          | x[i] = z         |
-| (sizeof x)            | sizeof(x)        |
-| (cast i32\* x)         | (int32_t\*)x      |
+| `(+ x y)`               | `x + y`            |
+| `(- x y)`               | `x - y`            |
+| `(* x y)`               | `x * y`            |
+| `(/ x y)`               | `x / y`            |
+| `(mod x y)`             | `x % y`            |
+| `(= x y)`               | `x == y`           |
+| `(not= x y)`            | `x != y`           |
+| `(< x y)`               | `x < y`            |
+| `(> x y)`               | `x > y`            |
+| `(<= x y)`              | `x <= y`           |
+| `(>= x y)`              | `x >= y`           |
+| `(or x y)`              | x &#124;&#124; y |
+| `(and x y)`             | `x && y`         |
+| `(bit-and x y)`         | `x & y`          |
+| `(bit-or x y)`          | x &#124; y      |
+| `(bit-xor x y)`         | `x ^ y`          |
+| `(bit-shift-left x y)`  | `x << y`         |
+| `(bit-shift-right x y)` | `x >> y`        |
+| `(set! x y)`            | `x = y`          |
+| `(and= x y)`            | `x &= y`         |
+| `(or= x y)`             | x &#124;= y     |
+| `(xor= x y)`            | `x ^= y`         |
+| `(inc x)`               | `++x`              |
+| `(post-inc x)`          | `x++`              |
+| `(dec x)`               | `--x`              |
+| `(post-dec x)`          | `x--`              |
+| `(not x)`               | `!x`               |
+| `(bit-not x)`           | `~x`               |
+| `(. x y)`               | `x.y`              |
+| `(ref x)`               | `&x`               |
+| `(deref x)` *or* `@x`   | `*x`               |
+| `(aget x i)`            | `x[i]`             |
+| `(aset x i y)`          | `x[i] = y`         |
+| `(sizeof x)`            | `sizeof(x)`        |
+| `(cast i32* x)`        | `(int32_t*)x`      |
    
 ### c-in-clj statements
     
