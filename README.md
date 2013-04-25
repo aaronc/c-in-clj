@@ -154,17 +154,17 @@ not done carefully.
 | (> x y)               | x > y            |
 | (<= x y)              | x <= y           |
 | (>= x y)              | x >= y           |
-| (or x y)              | (x &#124;&#124; y) |
-| (and x y)             | (x && y)         |
-| (bit-and x y)         | (x & y)          |
-| (bit-or x y)          | (x &#124; y)      |
-| (bit-xor x y)         | (x ^ y)          |
-| (bit-shift-left x y)  | (x << y)         |
-| (bit-shift-right x y) | (x >> y)         |
-| (set! x y)            | (x = y)          |
-| (and= x y)            | (x &= y)         |
-| (or= x y)             | (x &#124;= y)     |
-| (xor= x y)            | (x ^= y)         |
+| (or x y)              | x &#124;&#124; y |
+| (and x y)             | x && y         |
+| (bit-and x y)         | x & y          |
+| (bit-or x y)          | x &#124; y      |
+| (bit-xor x y)         | x ^ y          |
+| (bit-shift-left x y)  | x << y         |
+| (bit-shift-right x y) | x >> y        |
+| (set! x y)            | x = y          |
+| (and= x y)            | x &= )         |
+| (or= x y)             | x &#124;= y     |
+| (xor= x y)            | x ^= y         |
 | (inc x)               | ++x              |
 | (post-inc x)          | x++              |
 | (dec x)               | --x              |
