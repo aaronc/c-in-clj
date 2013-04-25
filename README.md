@@ -57,10 +57,10 @@ the Clojure REPL.
 
 ### Create c function:
 
-#+begin_src clojure
+```clojure
 (cdefn function_name ^return_type [^arg1_type arg1]
   function_body...)
-#+end_src
+```
 
 ex:
 
@@ -71,8 +71,9 @@ ex:
 
 ### Instrinsic types:
 - Fixed width integer types from <stdint.h> with the corresponding aliases:
+
 | Type     | Alias(es) |
-|----------+-----------|
+|----------|-----------|
 | int8_t   | i8        |
 | uint8_t  | u8        |
 | int16_t  | i16       |
@@ -94,11 +95,11 @@ Multiple *'s can be added to the end of a type name as needed.
 ### Structures
 C structure's can be defined as below:
 
-#+begin_src clojure
+```clojure
 (cstruct struct_name
  (member1_type member1)
  ...)
-#+end_src
+```
 
 ### Anonymous symbol and type names
 Anonymous symbol and type names can be used to interact with external
@@ -141,7 +142,7 @@ not done carefully.
 ### Keywords and Operators:
 
 | c-in-clj expression   | c equivalent     |
-|-----------------------+------------------|
+|-----------------------|------------------|
 | (+ x y)               | x + y            |
 | (- x y)               | x - y            |
 | (* x y)               | x * y            |
@@ -153,16 +154,16 @@ not done carefully.
 | (> x y)               | x > y            |
 | (<= x y)              | x <= y           |
 | (>= x y)              | x >= y           |
-| (or x y)              | (x \|\| y) |
+| (or x y)              | (x &#124;&#124; y) |
 | (and x y)             | (x && y)         |
 | (bit-and x y)         | (x & y)          |
-| (bit-or x y)          | (x \vert y)      |
+| (bit-or x y)          | (x &#124; y)      |
 | (bit-xor x y)         | (x ^ y)          |
 | (bit-shift-left x y)  | (x << y)         |
 | (bit-shift-right x y) | (x >> y)         |
 | (set! x y)            | (x = y)          |
 | (and= x y)            | (x &= y)         |
-| (or= x y)             | (x \vert= y)     |
+| (or= x y)             | (x &#124;= y)     |
 | (xor= x y)            | (x ^= y)         |
 | (inc x)               | ++x              |
 | (post-inc x)          | x++              |
@@ -173,11 +174,11 @@ not done carefully.
 | (. x y)               | x.y              |
 | (-> x y)              | x->y             |
 | (ref x)               | &x               |
-| (deref x) or @x       | *x               |
+| (deref x) *or* @x       | *x               |
 | (aget x i)            | x[i]             |
 | (aset x i z)          | x[i] = z         |
 | (sizeof x)            | sizeof(x)        |
-| (cast i32* x)         | (int32_t*)x      |
+| (cast i32\* x)         | (int32_t\*)x      |
    
 ### c-in-clj statements
     
