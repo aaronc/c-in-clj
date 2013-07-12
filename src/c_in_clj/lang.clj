@@ -17,6 +17,8 @@
 
 (defprotocol IType)
 
+(declare lookup-type)
+
 (defmulti write-type class)
 
 (defmethod write-type ::Type [{:keys [type-name]}] type-name)
@@ -27,7 +29,7 @@
   IHasType
   (get-type [_] target-type)
   IExpression
-  (write-expr [_] (str "((" (write-type target-type) ")" (write-expr expr) ")")))
+  (write-expr [_] (str "((" (write-type (lookup-type target-type)) ")" (write-expr expr) ")")))
 
 (defmethod create-explicit-cast-expr :default [this expr]
   (DefaultCastExpression. this expr))
