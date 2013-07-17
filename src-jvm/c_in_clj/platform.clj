@@ -9,3 +9,5 @@
        'i64)
      (= ntype Double)
      'double)))
+
+(defn get-env-variable [var-name] (System/getenv var-name))

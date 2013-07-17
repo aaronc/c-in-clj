@@ -22,22 +22,28 @@
 ;; These multimethods can be defined on any type, expr, or decl:
 ;; get-name, get-name, sym->expr, list->expr"
 
-(ns c-in-clj.lang.api)
-
+(ns c-in-clj.lang.api
+  (:require [clojure.tools.logging :as log]))
 
 (defn is-an-instance? [x t] (isa? (type x) t))
+
+(defmacro defmethod+ [method-name dispatch-value params & body]
+  `(defmethod ~method-name ~dispatch-value
+     ~(symbol (str (name method-name) "-" (name dispatch-value)))
+     ~params ~@body))
 
 ;; Methods which can apply to all c-in-clj elements
 
 (defmulti get-name class)
 
-(defmethod get-name :default [x] (when (instance? clojure.lang.Named x) (name x)))
+(defmethod+ get-name :default
+  [x] (when (instance? clojure.lang.Named x) (name x)))
 
 (defmulti get-type class)
 
-(defmethod get-type :default [_] nil)
+(defmethod+ get-type :default [_] nil)
 
-(defmulti list->expr (fn [this args & opts] (class this)))
+(defmulti list->expr (fn list->expr-dispatcher [this args & opts] (class this)))
 
 (defmulti sym->expr class)
 
@@ -49,13 +55,13 @@
 
 (defmulti expr-write class)
 
-(defmulti expr-wrap-last (fn [expr func] (class expr)))
+(defmulti expr-wrap-last (fn expr-wrap-last-dispatcher [expr func] (class expr)))
 
-(defmethod expr-wrap-last ::Expression [expr func] (func expr))
+(defmethod+ expr-wrap-last ::Expression [expr func] (func expr))
 
 (defmulti expr-category class)
 
-(defmethod expr-category :default [_] nil)
+(defmethod+ expr-category :default [_] nil)
 
 ;; Types
 
@@ -63,9 +69,11 @@
 
 (defn is-type? [x] (is-an-instance? x ::Type))
 
-(defmulti type-common-denominator (fn [this & args] (class this)))
+(defmulti type-common-denominator
+  (fn type-common-denominator-dispatcher [this & args] (class this)))
 
-(defmulti type-create-field-access-expr (fn [this & args] (class this)))
+(defmulti type-create-field-access-expr
+  (fn type-create-field-access-expr-dispatcher [this & args] (class this)))
 
 (defmulti type-dereferenced-type class)
 
@@ -77,30 +85,32 @@
 
 (defmulti type-get-fields class)
 
-(defmulti type-write-decl-expr (fn [this & args] (class this)))
+(defmulti type-write-decl-expr
+  (fn type-write-decl-expr-dispatcher [this & args] (class this)))
 
-(defmulti type-create-explicit-cast-Expr (fn [this expr] (class this)))
+(defmulti type-create-explicit-cast-expr
+  (fn type-create-explicit-cast-expr-dispatcher [this expr] (class this)))
 
 (defmulti type-default-initializer class)
 
 (defmulti type-requires-initialization class)
 
 ;; Type method defaults
-(defmethod get-name ::Type [x] (:type-name x))
+(defmethod+ get-name ::Type [x] (:type-name x))
 
-(defmethod type-common-denominator ::Type [_ other-type])
+(defmethod+ type-common-denominator ::Type [_ other-type])
 
-(defmethod type-write ::Type [{:keys [type-name]}] type-name)
+(defmethod+ type-write ::Type [{:keys [type-name]}] type-name)
 
-(defmethod type-is-reference? ::Type [_] false)
+(defmethod+ type-is-reference? ::Type [_] false)
 
-(defmethod type-is-function? ::Type [_] false)
+(defmethod+ type-is-function? ::Type [_] false)
 
-(defmethod type-get-fields ::Type [_])
+(defmethod+ type-get-fields ::Type [_])
 
-(defmethod type-default-initializer :default [_])
+(defmethod+ type-default-initializer :default [_])
 
-(defmethod type-requires-initialization :default [_] false)
+(defmethod+ type-requires-initialization :default [_] false)
 
 ;; Declarations
 
@@ -112,7 +122,11 @@
 
 (defmulti decl-write-impl class)
 
-(defmethod decl-write-impl :default [_])
+(defmethod+ decl-write-impl :default [_])
+
+(defmulti decl-get-ns-sym class)
+
+(defmulti decl-clone (fn [decl new-ns-sym]))
 
 ;; Scopes
 
@@ -120,17 +134,24 @@
 
 (defn is-scope? [x] (is-an-instance? x ::Scope))
 
-(defmulti scope-add (fn [scope & decls] (class scope)))
+(defmulti scope-add
+  (fn scope-add-dispatcher [scope decl] (class scope)))
 
-(defmulti scope-lookup-symbol (fn [scope sym] (class scope)))
+(defmulti scope-lookup-symbol
+  (fn scope-lookup-symbol-dispatcher [scope sym] (class scope)))
 
-(defmulti scope-lookup-type (fn [scope sym] (class scope)))
+(defmulti scope-lookup-type
+  (fn scope-lookup-type-dispatcher [scope sym] (class scope)))
 
-(defmulti scope-form->expr (fn [scope sym] (class scope)))
+(defmulti scope-form->expr
+  (fn scope-form->expr-dispatcher [scope form] (class scope)))
 
 (defmulti scope-get-allocator class)
 
-(defmulti scope-hook (fn [scope hook-name & args] class))
+(defmulti scope-hook
+  (fn scope-hook-dispatcher [scope hook-name & args] (class scope)))
+
+(defmethod+ scope-hook :default [scope hook-name & args])
 
 (def ^:dynamic *scope* nil)
 
@@ -149,20 +170,28 @@
 ;; Helper functions to be used in writing expr's, type's, and decl's
 
 (defn lookup-type [sym & {:as opts}]
+  (log/trace "Looking up type" sym)
   (or (scope-lookup-type (get-scope) sym)
       (when (:throw opts)
-        (throw (ex-info (str "Unable to resolve type" sym)
+        (throw (ex-info (str "Unable to resolve type " sym)
                         {:type ::unresolved-type
                          :symbol sym})))))
 
 (defn lookup-symbol [sym & {:as opts}]
+  (log/trace "Looking up symbol" sym)
   (or (scope-lookup-symbol (get-scope) sym)
       (when (:throw opts)
-        (throw (ex-info (str "Unable to resolve symbol" sym)
+        (throw (ex-info (str "Unable to resolve symbol " sym)
                         {:type ::unresolved-symbol
                          :symbol sym})))))
 
-(defn ->expr [form] (scope-form->expr (get-scope) form))
+(defn refresh-decl [decl]
+  (if (is-decl? decl)
+    ()))
+
+(defn ->expr [form]
+  (log/trace "Expanding" form)
+  (scope-form->expr (get-scope) form))
 
 ;; Some other useful constructs which will likely be used across languages
 
@@ -172,13 +201,14 @@
 
 (defn is-allocator? [x] (is-an-instance? x ::Allocator))
 
-(defmulti allocator-alloc (fn [allocator & args] (class allocator)))
+(defmulti allocator-alloc
+  (fn allocator-alloc-dispatcher [allocator & args] (class allocator)))
 
-(defmulti allocator-free (fn [allocator & args] (class allocator)))
+(defmulti allocator-free
+  (fn allocator-free-dispatcher [allocator & args] (class allocator)))
 
 ;; Aliases
 
 (defrecord Alias [target-sym])
 
-(defmethod sym->expr Alias [alias] (:target-sym alias))
-
+(defmethod+ sym->expr Alias [alias] (:target-sym alias))

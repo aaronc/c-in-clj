@@ -6,21 +6,21 @@
 
 (derive-type ::CType)
 
-(defn derive-ctype [cls] cls ::CType)
+(defn derive-ctype [cls] (derive cls ::CType))
 
-(defmethod type-write-decl-expr ::CType
+(defmethod+ type-write-decl-expr ::CType
   ([{:keys [type-name]} var-name] (str type-name " " var-name))
   ([{:keys [type-name]} var-name pointer-depth]
      (str type-name (apply str (repeat pointer-depth "*")) " " var-name)))
 
 (defrecord DefaultCastExpression [target-type expr])
 
-(defmethod get-type DefaultCastExpression [x] (:target-type x))
+(defmethod+ get-type DefaultCastExpression [x] (:target-type x))
 
-(defmethod expr-write DefaultCastExpression [{:keys [expr target-type]}]
+(defmethod+ expr-write DefaultCastExpression [{:keys [expr target-type]}]
   (str "((" (type-write target-type) ")" (expr-write expr) ")"))
 
-(defmethod type-create-explicit-cast-Expr ::CType [this expr]
+(defmethod+ type-create-explicit-cast-expr ::CType [this expr]
   (DefaultCastExpression. this expr))
 
 (defrecord PrimitiveType [type-name])
@@ -30,12 +30,11 @@
 (def ^:private primitive-types (atom {}))
 
 (defn add-primitives [& type-syms]
-  (doseq [sym type-syms]
-    (let [type-name (name sym)]
-      (swap! primitive-types
-             assoc
-             type-name
-             (PrimitiveType. type-name)))))
+  (doseq [type-name type-syms]
+    (swap! primitive-types
+           assoc
+           type-name
+           (PrimitiveType. type-name))))
 
 (add-primitives
  'void 'size_t 'ptrdiff_t 
@@ -43,13 +42,21 @@
  'int8_t 'int16_t 'int32_t 'int64_t
  'uint8_t 'uint16_t 'uint32_t 'uint64_t)
 
+;; Var Args
+
+(defrecord VarArgsType [])
+(derive-ctype VarArgsType)
+(defmethod+ get-name VarArgsType [_] "...")
+(defmethod+ type-write-decl-expr VarArgsType [_ _] "...")
+
+
 ;; Aliases
 
 (defn add-primitive-type-alias [alias-sym target-sym]
   (swap! primitive-types
          assoc
          alias-sym
-         (->Alias target-sym)))
+         target-sym))
 
 (add-primitive-type-alias 'i8 'int8_t)
 (add-primitive-type-alias 'i16 'int16_t)
@@ -62,51 +69,51 @@
 
 (defrecord PointerType [type-name])
 
-(defmethod get-name PointerType [{:keys [type-name]}]
+(defmethod+ get-name PointerType [{:keys [type-name]}]
   (str (name type-name) "*"))
 
 (derive-ctype PointerType)
 
-(defmethod type-write-decl-expr PointerType
+(defmethod+ type-write-decl-expr PointerType
   ([{:keys [type-name]} var-name]
      (type-write-decl-expr (lookup-type type-name) var-name 1))
   ([{:keys [type-name]} var-name pointer-depth]
      (type-write-decl-expr (lookup-type type-name) var-name (inc pointer-depth))))
 
-(defmethod type-is-function? PointerType [{:keys [type-name]}]
+(defmethod+ type-is-function? PointerType [{:keys [type-name]}]
   (type-is-function? (lookup-type type-name)))
 
-(defmethod type-is-reference? PointerType [_] true)
+(defmethod+ type-is-reference? PointerType [_] true)
 
-(defmethod type-write PointerType
+(defmethod+ type-write PointerType
   [{:keys [type-name]}]
   (str (type-write (lookup-type type-name)) "*"))
 
-(defmethod type-create-field-access-expr PointerType
+(defmethod+ type-create-field-access-expr PointerType
   ([this instance-expr member-name]
      (type-create-field-access-expr this instance-expr member-name 1))
   ([{:keys [type-name]} instance-expr member-name pointer-depth]
      (type-create-field-access-expr (lookup-type type-name) instance-expr member-name pointer-depth)))
 
-(derive-ctype ::Literal)
+(derive-expr ::Literal)
 
 (defn derive-literal [cls] (derive cls ::Literal))
 
-(defmethod expr-category ::Literal [_] :literal)
+(defmethod+ expr-category ::Literal [_] :literal)
 
 (defrecord Literal [ctype value])
 (derive-literal Literal)
-(defmethod expr-write Literal [{:keys [value]}] (pr-str value))
-(defmethod get-type Literal [{:keys [ctype]}] (lookup-type ctype))
+(defmethod+ expr-write Literal [{:keys [value]}] (pr-str value))
+(defmethod+ get-type Literal [{:keys [ctype]}] (lookup-type ctype))
 
 (defrecord CharLiteral [value])
 (derive-literal CharLiteral)
-(defmethod expr-write CharLiteral [{:keys [value]}] (str "'" value "'"))
-(defmethod get-type Literal [{:keys [ctype]}] (lookup-type 'char))
+(defmethod+ expr-write CharLiteral [{:keys [value]}] (str "'" value "'"))
+(defmethod+ get-type Literal [{:keys [ctype]}] (lookup-type 'char))
 
 (defrecord NullLiteral [])
 (derive-literal NullLiteral)
-(defmethod expr-write NullLiteral [_] "NULL")
+(defmethod+ expr-write NullLiteral [_] "NULL")
 (def null-literal (NullLiteral.))
 
 (defn cnum->expr [x]
@@ -126,7 +133,7 @@
   (or
    (cmember-access-list->expr sym args)
    (when-let [resolved (lookup-symbol sym)]
-     (if-let [func (get-method list->expr resolved)]
+     (if-let [func (get-method list->expr (class resolved))]
        (->expr (func resolved args))
        (when (::macro (meta resolved))
          (->expr (apply resolved args)))))
@@ -138,7 +145,7 @@
 (defn boolean? [x] (or (= x true) (= x false)))
 
 (defrecord InitializerList [values])
-(defmethod expr-write InitializerList
+(defmethod+ expr-write InitializerList
   [{:keys [values]}]
   (str "{" (str/join ", " (map expr-write values)) "}"))
 
@@ -147,7 +154,7 @@
 
 (defrecord AnonymousVariableRefExpression [var-name])
 (derive-expr AnonymousVariableRefExpression)
-(defmethod expr-write AnonymousVariableRefExpression
+(defmethod+ expr-write AnonymousVariableRefExpression
   [{:keys [var-name]}]
   (name var-name))
 
@@ -164,7 +171,7 @@
    (vector? form) (cvec->expr form)
    (is-expr? form) form
    :default
-   (if-let [as-expr (get-method sym->expr form)]
+   (if-let [as-expr (get-method sym->expr (type form))]
      (cform->expr (as-expr form))
      (throw (ex-info (str "Don't know how to handle " form " of type " (type form))
                      {:type ::expression-parse-error
@@ -213,15 +220,15 @@
 
 (defrecord BinOp [sym x y])
 (derive-expr BinOp)
-(defmethod expr-write BinOp
+(defmethod+ expr-write BinOp
   [{:keys [sym x y]}]
   (str "(" (expr-write x) " " (name sym) " " (expr-write y) ")"))
-(defmethod get-type BinOp
+(defmethod+ get-type BinOp
   [{:keys [sym x y]}]
   (get-bin-op-type x y))
 
 (defn parse-bin-op [sym x y]
-  (BinOp. sym (->expr x) (->expr x)))
+  (BinOp. sym (->expr x) (->expr y)))
 
 (defn- add-bin-op [op-sym output-sym]
   (add-intrinsic op-sym (partial parse-bin-op output-sym)))
@@ -237,13 +244,13 @@
 
 (defrecord CompOp [sym x y])
 (derive-expr CompOp)
-(defmethod expr-write CompOp
+(defmethod+ expr-write CompOp
   [{:keys [sym x y]}]
   (str "(" (expr-write x) " " (name sym) " " (expr-write y) ")"))
-(defmethod get-type CompOp [_] 'bool)
+(defmethod+ get-type CompOp [_] 'bool)
 
 (defn parse-comp-op [sym x y]
-  (CompOp. sym (->expr x) (->expr x)))
+  (CompOp. sym (->expr x) (->expr y)))
 
 (doseq [s '[< > <= >=]]
   (add-intrinsic s (partial parse-comp-op s)))
@@ -255,12 +262,12 @@
 
 (defrecord AssignOp [sym target source])
 (derive-expr AssignOp)
-(defmethod expr-write AssignOp
+(defmethod+ expr-write AssignOp
   [{:keys [sym target source]}]
   (str "(" (expr-write target) " " sym " " (reduce-parens (expr-write source)) ")"))
 
 (defn parse-assign-op [sym target source]
-  (expr-wrap-last source (fn [x] (AssignOp. sym target x))))
+  (expr-wrap-last (->expr source) (fn [x] (AssignOp. sym (->expr target) x))))
 
 (defn add-assign-op [op-sym output-sym]
   (add-intrinsic op-sym (partial parse-assign-op output-sym)))
@@ -280,12 +287,12 @@
 
 (defrecord NOperation [sym args])
 (derive-expr NOperation)
-(defmethod expr-write NOperation
+(defmethod+ expr-write NOperation
   [{:keys [sym args]}]
   (if (= 1 (count args))
     (str (name sym) (expr-write (first args)))
              (str "(" (str/join (str " " sym " ") (map expr-write args)) ")"))  )
-(defmethod get-type NOperation
+(defmethod+ get-type NOperation
   [{:keys [sym args]}]
   (apply get-bin-op-type args))
 
@@ -296,10 +303,10 @@
 
 (defrecord NCompOperation [sym args])
 (derive-expr NCompOperation)
-(defmethod expr-write NCompOperation
+(defmethod+ expr-write NCompOperation
   [{:keys [sym args]}]
   (str "(" (str/join (str " " sym " ") (map expr-write args)) ")")  )
-(defmethod get-type NCompOperation [_] 'bool)
+(defmethod+ get-type NCompOperation [_] 'bool)
 
 (defn parse-comp*op [sym & args]
   (NCompOperation. sym (doall (map ->expr args))))
@@ -309,46 +316,45 @@
 
 (defrecord UnaryOperation [func x])
 (derive-expr UnaryOperation)
-(defmethod expr-write UnaryOperation
+(defmethod+ expr-write UnaryOperation
   [{:keys [func x]}]
   (func (expr-write x)))
 
-(defn parse-un-op [func x] (UnaryOperation. func (->expr x)))
+(defn parse-unary-op [func x] (UnaryOperation. func (->expr x)))
 
-(defn add-un-op [sym func]
-  (add-intrinsic sym (partial parse-un-op)))
+(defn add-unary-op [sym func]
+  (add-intrinsic sym (partial parse-unary-op func)))
 
-(add-un-op 'inc #(str "++" %))
-(add-un-op 'dec #(str "--" %))
-(add-un-op 'post-inc #(str % "++"))
-(add-un-op 'post-dec #(str % "--"))
-(add-un-op 'bit-not #(str "~" %))
+(add-unary-op 'inc #(str "++" %))
+(add-unary-op 'dec #(str "--" %))
+(add-unary-op 'post-inc #(str % "++"))
+(add-unary-op 'post-dec #(str % "--"))
+(add-unary-op 'bit-not #(str "~" %))
 
 (defrecord NotExpression [x])
 (derive-expr NotExpression)
-(defmethod expr-write NotExpression
+(defmethod+ expr-write NotExpression
   [{:keys [x]}]
   (str "!" (expr-write x)))
-(defmethod get-type NotExpression [_] 'bool)
+(defmethod+ get-type NotExpression [_] 'bool)
 (defn parse-not-op [x] (NotExpression. (->expr x)))
 (add-intrinsic 'not parse-not-op)
 
 (defrecord SizeofExpression [x])
 (derive-expr SizeofExpression)
-(defmethod expr-write SizeofExpression
+(defmethod+ expr-write SizeofExpression
   [{:keys [x]}]
-  (let [type (lookup-type x)]
-    (str "sizeof(" (type-write type) ")")))
-(defmethod get-type SizeofExpression [_] 'size_t)
-(add-intrinsic 'sizeof (fn [x] (SizeofExpression. x)))
+  (str "sizeof(" (type-write (get-type x)) ")"))
+(defmethod+ get-type SizeofExpression [_] 'size_t)
+(add-intrinsic 'sizeof (fn [x] (SizeofExpression. (->expr x))))
 
 (defrecord ComputedFunctionCallExpression [func-expr args])
 (derive-expr ComputedFunctionCallExpression)
-(defmethod expr-write ComputedFunctionCallExpression
+(defmethod+ expr-write ComputedFunctionCallExpression
   [{:keys [func-expr args]}]
   (str (expr-write func-expr)
        "(" (str/join "," (map expr-write args)) ")"))
-(defmethod get-type ComputedFunctionCallExpression
+(defmethod+ get-type ComputedFunctionCallExpression
   [{:keys [func-expr]}]
   (get-type func-expr))
 
@@ -365,7 +371,7 @@
 
 (defrecord StructureDereferenceExpression [source target])
 (derive-expr StructureDereferenceExpression)
-(defmethod expr-write StructureDereferenceExpression
+(defmethod+ expr-write StructureDereferenceExpression
   [{:keys [source target]}]
   (str (expr-write source) "->" (expr-write target)))
 (add-intrinsic '.->
@@ -373,40 +379,42 @@
 
 (defrecord ArrayGetExpression [target idx])
 (derive-expr ArrayGetExpression)
-(defmethod expr-write ArrayGetExpression
+(defmethod+ expr-write ArrayGetExpression
   [{:keys [target idx]}]
   (str (expr-write target) "[" (expr-write idx) "]"))
-(defmethod get-type ArrayGetExpression
+(defmethod+ get-type ArrayGetExpression
   [{:keys [target idx]}]
   (lookup-type (type-dereferenced-type (get-type target))))
 (add-intrinsic 'aget (fn [target idx] (ArrayGetExpression. (->expr target) (->expr idx))))
 
 (defrecord ArraySetExpression [target idx value])
 (derive-expr ArraySetExpression)
-(defmethod expr-write ArraySetExpression
+(defmethod+ expr-write ArraySetExpression
   [{:keys [target idx value]}]
   (str (expr-write target) "[" (expr-write idx) "] = " (expr-write value)))
 (add-intrinsic 'aset
                (fn [target idx value]
-                 (expr-wrap-last value (fn [x] (ArraySetExpression. (->expr target) (->expr idx) x)))))
+                 (expr-wrap-last
+                  (->expr value)
+                  (fn [x] (ArraySetExpression. (->expr target) (->expr idx) x)))))
 
 (defrecord RefExpression [x])
 (derive-expr RefExpression)
-(defmethod expr-write RefExpression
+(defmethod+ expr-write RefExpression
   [{:keys [x]}]
   (str  "(&" (expr-write x) ")"))
 (add-intrinsic 'ref (fn [x] (RefExpression. (->expr x))))
 
 (defrecord DerefExpression [x])
 (derive-expr DerefExpression)
-(defmethod expr-write DerefExpression
+(defmethod+ expr-write DerefExpression
   [{:keys [x]}]
   (str  "*" (expr-write x)))
 (add-intrinsic 'deref (fn [x] (DerefExpression. (->expr x))))
 
 (defrecord CVerbatim [args])
 (derive-expr CVerbatim)
-(defmethod expr-write CVerbatim
+(defmethod+ expr-write CVerbatim
   [{:keys [args]}]
   (apply str (map (fn [x] (if (string? x) x (expr-write x))) args)))
 (add-intrinsic 'c*
@@ -428,15 +436,15 @@
 
 (defrecord Statement [expr noindent])
 (derive-expr Statement)
-(defmethod expr-wrap-last Statement
+(defmethod+ expr-wrap-last Statement
   [{:keys [expr noindent]} func]
   (Statement. (func expr) noindent))
-(defmethod expr-write Statement
+(defmethod+ expr-write Statement
   [{:keys [expr noindent]}]
   (str (when-not noindent (indent)) (reduce-parens (expr-write expr)) ";"))
-(defmethod get-type Statement
+(defmethod+ get-type Statement
   [{:keys [expr noindent]}] (get-type expr))
-(defmethod expr-category Statement [_] :statement)
+(defmethod+ expr-category Statement [_] :statement)
 
 (defn cstatement [expr & {:keys [noindent]}]
   (let [expr (->expr expr)]
@@ -451,24 +459,24 @@
 
 (defrecord Statements [statements])
 (derive-expr Statements)
-(defmethod expr-write Statements
+(defmethod+ expr-write Statements
   [{:keys [statements]}]
   (str/join "\n" (map expr-write statements)))
-(defmethod expr-wrap-last Statements
+(defmethod+ expr-wrap-last Statements
   [{:keys [statements]} func]
   (Statements.
    (wrap-statements func statements)))
-(defmethod get-type Statements
+(defmethod+ get-type Statements
   [{:keys [statements]}]
   (get-type (last statements)))
-(defmethod expr-category Statements [_] :statement*)
+(defmethod+ expr-category Statements [_] :statement*)
 
 (defn cstatements [statements]
   (Statements. (doall (map cstatement (remove nil? statements)))))
 
 (defrecord CaseExpression [test cases])
 (derive-expr CaseExpression)
-(defmethod expr-write CaseExpression
+(defmethod+ expr-write CaseExpression
   [{:keys [test cases]}]
   (let [cases
         (binding [*indent* (inc *indent*)]
@@ -479,7 +487,7 @@
                 (str (indent) "case " (expr-write expr) ":\n" block "\n" (indent) "break;\n"))
               (str (indent) "default:" (expr-write expr) "\n" (indent) "break;\n"))))]
     (str "switch(" (expr-write test) ") {\n" (str/join "\n" cases) (indent) "\n}")))
-(defmethod expr-wrap-last CaseExpression
+(defmethod+ expr-wrap-last CaseExpression
   [{:keys [test cases]} func]
   (CaseExpression.
    test
@@ -487,7 +495,7 @@
      (if block
        [expr (expr-wrap-last block func)]
        [(expr-wrap-last expr func)]))))
-(defmethod expr-category CaseExpression [_] :statement)
+(defmethod+ expr-category CaseExpression [_] :statement)
 (add-intrinsic
  'case
  (fn [test & args]
@@ -506,10 +514,10 @@
 
 (defrecord ReturnExpression [expr])
 (derive-expr ReturnExpression)
-(defmethod get-type ReturnExpression
+(defmethod+ get-type ReturnExpression
   [{:keys [expr]}]
   (get-type expr))
-(defmethod expr-write ReturnExpression
+(defmethod+ expr-write ReturnExpression
   [{:keys [expr]}]
   (if expr
     (if-let [expr (expr-write expr)]
@@ -528,7 +536,7 @@
 
 (defrecord IfExpression [expr then else])
 (derive-expr IfExpression)
-(defmethod expr-write IfExpression
+(defmethod+ expr-write IfExpression
   [{:keys [expr then else]}]
   (str (indent)
        "if(" (reduce-parens (expr-write expr)) ")\n"
@@ -536,13 +544,13 @@
        (when else
          (str "\n" (indent) "else\n"
               (expr-write else)))))
-(defmethod expr-wrap-last IfExpression
+(defmethod+ expr-wrap-last IfExpression
   [{:keys [expr then else]} func]
                 (IfExpression.
                  expr
                  (expr-wrap-last then func)
                  (when else (expr-wrap-last else func))))
-(defmethod expr-category IfExpression [_] :statement*)
+(defmethod+ expr-category IfExpression [_] :statement*)
 
 (add-intrinsic 'if
              (fn
@@ -557,28 +565,28 @@
 
 (defrecord DeclExpression [var-type var-name init-expr])
 (derive-expr DeclExpression)
-(defmethod get-type DeclExpression
+(defmethod+ get-type DeclExpression
   [{:keys [var-type]}]
   var-type)
-(defmethod expr-write DeclExpression
+(defmethod+ expr-write DeclExpression
   [{:keys [var-type var-name init-expr]}] (str (type-write-decl-expr var-type var-name) "=" (when init-expr (expr-write init-expr))))
 
 (defrecord BlockExpression [statements])
 (derive-expr BlockExpression)
-(defmethod get-type BlockExpression
+(defmethod+ get-type BlockExpression
   [{:keys [statements]}]
   (get-type (last statements)))
-(defmethod expr-wrap-last BlockExpression
+(defmethod+ expr-wrap-last BlockExpression
   [{:keys [statements]} func]
   (BlockExpression.
    (wrap-statements func statements)))
-(defmethod expr-write BlockExpression
+(defmethod+ expr-write BlockExpression
   [{:keys [statements]}]
   (str (indent) "{\n"
        (binding [*indent* (inc *indent*)]
          (str/join "\n" (map expr-write statements)))
        "\n" (indent) "}"))
-(defmethod expr-category BlockExpression [_] :block)
+(defmethod+ expr-category BlockExpression [_] :block)
 
 (defn- cblock [& statements]
   (BlockExpression. (doall (map cstatement (remove nil? statements)))))
@@ -587,25 +595,25 @@
 
 (defrecord ForStatement [init-expr test-expr each-expr body])
 (derive-expr ForStatement)
-(defmethod expr-write ForStatement
+(defmethod+ expr-write ForStatement
   [{:keys [init-expr test-expr each-expr body]}]
   (str (indent) "for("
        (reduce-parens (expr-write init-expr)) "; "
        (reduce-parens (expr-write test-expr)) "; "
        (reduce-parens (expr-write each-expr)) ")\n"
        (expr-write body)))
-(defmethod expr-wrap-last ForStatement
+(defmethod+ expr-wrap-last ForStatement
   [_ _] (throw (Exception. "Cannot take value of for statement")))
-(defmethod expr-category ForStatement [_] :statement)
+(defmethod+ expr-category ForStatement [_] :statement)
 
 (defrecord CommaExpression [expressions])
 (derive-expr CommaExpression)
-(defmethod expr-write  CommaExpression [{:keys [expressions]}] (str/join ", " (map expr-write expressions)))
-(defmethod expr-category CommaExpression [_] :statement)
+(defmethod+ expr-write  CommaExpression [{:keys [expressions]}] (str/join ", " (map expr-write expressions)))
+(defmethod+ expr-category CommaExpression [_] :statement)
 
 (defrecord NopExpression [])
 (derive-expr NopExpression)
-(defmethod expr-write NopExpression [_])
+(defmethod+ expr-write NopExpression [_])
 
 (defn- wrap-for-expressions [form]
   (cond
@@ -627,12 +635,12 @@
 
 (defrecord WhileStatement [test-expr body])
 (derive-expr WhileStatement)
-(defmethod expr-write WhileStatement
+(defmethod+ expr-write WhileStatement
   [{:keys [test-expr body]}]
   (str (indent) "while(" (reduce-parens (expr-write test-expr)) ")\n"
        (expr-write body)))
-(defmethod expr-wrap-last WhileStatement [_ _] (throw (Exception. "Cannot take value of while statement")))
-(defmethod expr-category WhileStatement [_] :statement)
+(defmethod+ expr-wrap-last WhileStatement [_ _] (throw (Exception. "Cannot take value of while statement")))
+(defmethod+ expr-category WhileStatement [_] :statement)
 
 (add-intrinsic 'while
              (fn [test & body]
@@ -644,50 +652,51 @@
 
 (defrecord BreakStatement [])
 (derive-expr BreakStatement)
-(defmethod expr-write BreakStatement [_] "break")
+(defmethod+ expr-write BreakStatement [_] "break")
 (add-intrinsic 'break (fn [] (BreakStatement.)))
 
 (defrecord ContinueStatement [])
 (derive-expr ContinueStatement)
-(defmethod expr-write ContinueStatement [_] "continue")
-(add-intrinsic 'break (fn [] (ContinueStatement.)))
+(defmethod+ expr-write ContinueStatement [_] "continue")
+(add-intrinsic 'continue (fn [] (ContinueStatement.)))
 
 (defrecord LabelStatement [label])
 (derive-expr LabelStatement)
-(defmethod expr-write LabelStatement
+(defmethod+ expr-write LabelStatement
   [{:keys [label]}]
   (str (name label) ":"))
-(defmethod expr-category LabelStatement [_] :statement)
+(defmethod+ expr-category LabelStatement [_] :statement)
 (add-intrinsic 'label (fn [x] (LabelStatement. x)))
 
 (defrecord GotoStatement [label])
 (derive-expr GotoStatement)
-(defmethod expr-write GotoStatement
+(defmethod+ expr-write GotoStatement
   [{:keys [label]}]
   (str "goto" (name label)))
-(defmethod expr-category GotoStatement [_] :statement)
+(defmethod+ expr-category GotoStatement [_] :statement)
 (add-intrinsic 'goto (fn [x] (GotoStatement. x)))
 
 (defrecord VariableRefExpression [variable])
-(defmethod expr-write VariableRefExpression
+(derive-expr VariableRefExpression)
+(defmethod+ expr-write VariableRefExpression
   [{:keys [variable]}]
   (get-name variable))
-(defmethod get-type VariableRefExpression
+(defmethod+ get-type VariableRefExpression
   [{:keys [variable]}]
   (get-type variable))
 
 (defrecord VariableDeclaration [var-name var-type]
   clojure.lang.Named
   (getName [_] var-name))
-(defmethod get-type VariableDeclaration
+(defmethod+ get-type VariableDeclaration
   [{:keys [var-type]}] (lookup-type var-type))
-(defmethod expr-write VariableDeclaration
+(defmethod+ expr-write VariableDeclaration
   [{:keys [var-type var-name]}]
   (let [var-type (lookup-type var-type)]
     (str (type-write-decl-expr var-type var-name)
          (when-let [init (type-requires-initialization var-type)]
            (str " = " (type-default-initializer var-type))))))
-(defmethod sym->expr VariableDeclaration
+(defmethod+ sym->expr VariableDeclaration
   [this]
   (VariableRefExpression. this))
 
@@ -749,15 +758,15 @@
   clojure.lang.Named
   (getName [_] (str element-type-name "[" array-length "]")))
 (derive-type StaticArrayType)
-(defmethod type-write-decl-expr StaticArrayType
+(defmethod+ type-write-decl-expr StaticArrayType
   [{:keys [element-type-name array-length]} var-name]
   (str (type-write-decl-expr (lookup-type element-type-name) var-name)
        "[" array-length "]"))
-(defmethod type-is-reference? StaticArrayType [_] true)
-(defmethod type-write StaticArrayType
+(defmethod+ type-is-reference? StaticArrayType [_] true)
+(defmethod+ type-write StaticArrayType
   [{:keys [element-type-name array-length]}]
   (str (type-write (lookup-type element-type-name)) "[" array-length "]"))
-(defmethod type-dereferenced-type StaticArrayType
+(defmethod+ type-dereferenced-type StaticArrayType
   [{:keys [element-type-name]}]
   (lookup-type element-type-name))
 
@@ -779,7 +788,7 @@
                     :throw true)))))
 
 (defrecord AnonymousFieldAccessExpression [instance-expr member-name pointer-depth])
-(defmethod expr-write AnonymousFieldAccessExpression
+(defmethod+ expr-write AnonymousFieldAccessExpression
   [{:keys [instance-expr member-name pointer-depth]}]
   (let [prefix-pointer (when (>= pointer-depth 2)
                          (- pointer-depth 2))
@@ -799,7 +808,7 @@
   clojure.lang.Named
   (getName [_] type-name))
 (derive-type AnonymousType)
-(defmethod type-create-field-access-expr AnonymousType
+(defmethod+ type-create-field-access-expr AnonymousType
   ([this instance-expr member-name]
     (type-create-field-access-expr this instance-expr member-name 0))
   ([this instance-expr member-name pointer-depth]
@@ -807,12 +816,12 @@
 
 (defrecord CLanguageScope [])
 
-(defmethod scope-lookup-symbol
+(defmethod+ scope-lookup-symbol
   CLanguageScope
   [_ sym]
   (get @cintrinsics (name sym)))
 
-(defmethod scope-lookup-type
+(defmethod+ scope-lookup-type
   CLanguageScope
   [_ type-name]
   (cond
@@ -822,9 +831,13 @@
    (or
     (parse-static-array-type type-name)
     (parse-pointer-type type-name)
-    (get @primitive-types (name type-name)))))
+    (let [prim-type (get @primitive-types type-name)]
+      (if (is-type? prim-type)
+        prim-type
+        (get @primitive-types prim-type)))
+    (throw (ex-info (str "Unable to resolve type " type-name) {})))))
 
-(defmethod scope-form->expr
+(defmethod+ scope-form->expr
   CLanguageScope
   [_ form]
   (cform->expr form))

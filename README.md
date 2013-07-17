@@ -139,10 +139,10 @@ Please be aware that backends may or may not throw an error when you
 try to redefine a function signature which will result in errors if
 not done carefully.
 
-### Keywords and Operators:
+### Keywords and Operators
 
-| c-in-clj expression   | c equivalent     |
-|-----------------------|------------------|
+| c-in-clj expression     | c equivalent       |
+|-------------------------|--------------------|
 | `(+ x y)`               | `x + y`            |
 | `(- x y)`               | `x - y`            |
 | `(* x y)`               | `x * y`            |
@@ -154,17 +154,17 @@ not done carefully.
 | `(> x y)`               | `x > y`            |
 | `(<= x y)`              | `x <= y`           |
 | `(>= x y)`              | `x >= y`           |
-| `(or x y)`              | x &#124;&#124; y |
-| `(and x y)`             | `x && y`         |
-| `(bit-and x y)`         | `x & y`          |
-| `(bit-or x y)`          | x &#124; y      |
-| `(bit-xor x y)`         | `x ^ y`          |
-| `(bit-shift-left x y)`  | `x << y`         |
-| `(bit-shift-right x y)` | `x >> y`        |
-| `(set! x y)`            | `x = y`          |
-| `(and= x y)`            | `x &= y`         |
-| `(or= x y)`             | x &#124;= y     |
-| `(xor= x y)`            | `x ^= y`         |
+| `(or x y)`              | `x || y`           |
+| `(and x y)`             | `x && y`           |
+| `(bit-and x y)`         | `x & y`            |
+| `(bit-or x y)`          | `x | y`            |
+| `(bit-xor x y)`         | `x ^ y`            |
+| `(bit-shift-left x y)`  | `x << y`           |
+| `(bit-shift-right x y)` | `x >> y`           |
+| `(set! x y)`            | `x = y`            |
+| `(and= x y)`            | `x &= y`           |
+| `(or= x y)`             | `x |= y`           |
+| `(xor= x y)`            | `x ^= y`           |
 | `(inc x)`               | `++x`              |
 | `(post-inc x)`          | `x++`              |
 | `(dec x)`               | `--x`              |
@@ -176,20 +176,35 @@ not done carefully.
 | `(deref x)` *or* `@x`   | `*x`               |
 | `(aget x i)`            | `x[i]`             |
 | `(aset x i y)`          | `x[i] = y`         |
+| `(cast some_type x)`    | `(some_type)x`     |
 | `(sizeof x)`            | `sizeof(x)`        |
-| `(cast i32* x)`        | `(int32_t*)x`      |
    
 ### c-in-clj statements
-    
 #### {} blocks
 
++--------------------------------------+---------------------------------------+
+| c-in-clj expression                  | c equivalent                          |
++======================================+=======================================+
+| ```clojure                           | ```c                                  |
+| (do                                  | {                                     |
+|  (a)                                 |  a();                                 |
+|  (b)                                 |  b();                                 |
+|  (c))                                |  c();                                 |
+| ```                                  | }                                     |
+|                                      | ```                                   |
++--------------------------------------+---------------------------------------+
+
+<table>
+<tr>
+<td>
 ```clojure
 (do
  (a)
  (b)
  (c))
 ```
-
+</td>
+<td>
 ```c
 {
  a();
@@ -197,6 +212,9 @@ not done carefully.
  c();
 }
 ```
+</td>
+</tr>
+</table>
 #### if, else
 
 ```clojure
