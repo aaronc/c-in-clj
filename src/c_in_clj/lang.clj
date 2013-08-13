@@ -610,6 +610,7 @@
    (list? form) (cexpand-list form)
    (vector? form) (cexpand-vector form)
    (satisfies? IExpression form) form
+   (seq? form) (cexpand-list form)
    :default (throw (ArgumentException. (str "Don't know how to handle " form " of type " (type form))))))
 
 (defn- is-block? [expr]
