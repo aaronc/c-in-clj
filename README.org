@@ -74,7 +74,7 @@ ex:
 | Type     | Alias(es) |
 |----------+-----------|
 | int8_t   | i8        |
-| uint8_t  | u8        |
+| uint8_t  | u8, byte  |
 | int16_t  | i16       |
 | uint16_t | u16       |
 | int32_t  | i32       |
